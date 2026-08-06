@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: timescale/timescaledb:2.29.1-pg18
+    container_name: trade-bot-postgres
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: trade_bot
+    volumes:
+      - trade-bot-pg-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d trade_bot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  trade-bot-pg-data:

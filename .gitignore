@@ -1,0 +1,48 @@
+# --- Секреты. Строка 1 не по алфавиту, а по важности (ТАБУ п.2) ---
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+.deploy-keys/
+
+# --- Локальные данные и логи ---
+logs/
+*.log
+data/
+*.sqlite
+*.sqlite3
+*.db
+dumps/
+backups/
+
+# --- Node ---
+node_modules/
+dist/
+build/
+coverage/
+.nyc_output/
+*.tsbuildinfo
+.pnpm-store/
+
+# --- Python (на случай, если часть тулинга будет на нём) ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- ОС и редакторы ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# --- Временное ---
+tmp/
+.tmp/
+*.local
