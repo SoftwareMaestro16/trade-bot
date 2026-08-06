@@ -66,6 +66,9 @@ interface FailedSymbol {
   reason: string;
 }
 
+/** Intermediate row shape before `tier` (a per-symbol rank) is computed — see `fetchTiersForSymbol`'s own doc comment for why that can't come from the wire directly. */
+type UntieredRow = Omit<MarginTierJson, "tier">;
+
 /**
  * Fetches one symbol's full risk-limit tier ladder, following `nextPageCursor`
  * defensively (a live capture of BTCUSDT/ESPORTSUSDT/ADAUSDT during
@@ -84,9 +87,6 @@ interface FailedSymbol {
  * below is a widening one only (every field it reads is optional on the
  * target type), not a narrowing lie.
  */
-/** Intermediate row shape before `tier` (a per-symbol rank) is computed — see `fetchTiersForSymbol`'s own doc comment for why that can't come from the wire directly. */
-type UntieredRow = Omit<MarginTierJson, "tier">;
-
 async function fetchTiersForSymbol(
   client: PublicExchangeClient,
   limiter: RateLimiter,

@@ -1,5 +1,5 @@
 import nock from "nock";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { Kysely } from "kysely";
 import { PublicExchangeClient } from "../../src/exchange/client.js";
 import { RateLimiter } from "../../src/exchange/rateLimiter.js";
@@ -152,7 +152,12 @@ describe("collectSettledFunding", () => {
       })
       .execute();
 
-    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    // Logging moved from console.error to pino (RUNBOOK.md §8, 2026-08-07),
+    // which writes asynchronously/buffered (sonic-boom) — not reliably
+    // observable synchronously right after the call the way console.error's
+    // old, purely-synchronous call was. The behavior that actually matters —
+    // caught, not propagated, symbol marked failed, nothing written — is
+    // exactly what's asserted below directly against the return value.
     // Simulates Bybit's real, confirmed response shape for a startTime-without-
     // endTime request. bybit-api's client (throwExceptions:true, RR-51) turns
     // a non-zero retCode into a thrown error, which this test's own
@@ -167,11 +172,5 @@ describe("collectSettledFunding", () => {
 
     expect(result.failed).toEqual([SYM]);
     expect(result.written).toBe(0);
-    expect(consoleErrorSpy).toHaveBeenCalledWith(
-      expect.stringContaining("first failure this cycle"),
-      expect.anything(),
-    );
-
-    consoleErrorSpy.mockRestore();
   });
 });

@@ -16,6 +16,8 @@
     "killswitch-listener": "node --env-file=.env dist/killswitch-listener.js",
     "backfill:funding": "node --env-file=.env dist/scripts/backfillFundingHistory.js",
     "fetch:margin-tiers": "node dist/scripts/fetchMarginTierData.js",
+    "export:predictive-dataset": "node --env-file=.env dist/scripts/exportPredictiveTrainingDataset.js",
+    "run:emulation": "node --env-file=.env dist/scripts/runEmulationScenario.js",
     "migrate:up": "node-pg-migrate up -j sql --envPath .env",
     "migrate:down": "node-pg-migrate down -j sql --envPath .env",
     "migrate:create": "node-pg-migrate create -j sql"

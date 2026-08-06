@@ -16,6 +16,7 @@ data/
 *.db
 dumps/
 backups/
+reports/
 
 # --- Node ---
 node_modules/

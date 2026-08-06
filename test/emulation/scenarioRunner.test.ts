@@ -208,6 +208,28 @@ describe("runScenario", () => {
       expect(position.borrow_cost).not.toBeNull();
       expect(new Big(position.borrow_cost!).toString()).toBe("0");
 
+      // entry_reasoning now also captures open_interest/long_short_ratio context
+      // at entry (owner's ask, 2026-08-06: "что происходило на рынке") — "n/a"
+      // here specifically because this fixture never inserts open_interest/
+      // long_short_ratio rows at all, proving their absence is tolerated
+      // (context-only, never a veto input — see evaluateCandidate) rather than
+      // silently dropped from the string.
+      expect(position.entry_reasoning).not.toBeNull();
+      expect(position.entry_reasoning).toContain("r8h=0.001"); // HIGH_RATE, the rate active at t2
+      expect(position.entry_reasoning).toContain("openInterest=n/a");
+      expect(position.entry_reasoning).toContain("lsrBuyRatio=n/a");
+      expect(position.entry_reasoning).toContain("lsrSellRatio=n/a");
+
+      // exit_reasoning: symmetric to entry_reasoning (closePosition). This
+      // position is force-closed at range end (t4), never a strategy/
+      // exitRules.ts trigger — reasonCode=SCENARIO_END, held t2->t4 = 2h, and
+      // the funding rate/basis actually in effect at the close tick.
+      expect(position.exit_reasoning).not.toBeNull();
+      expect(position.exit_reasoning).toContain("reasonCode=SCENARIO_END");
+      expect(position.exit_reasoning).toContain("r8hAtExit=0.001"); // HIGH_RATE, still active at t4
+      expect(position.exit_reasoning).toContain("heldHours=2.00");
+      expect(position.exit_reasoning).not.toContain("liquidationPrice="); // only present for FORCED_LIQUIDATION
+
       // The core assertion: opened_at is t2 (first tick the PREDICTED rate turned
       // favorable) — never t0 or t1, despite the settled row's earlier timestamp.
       expect(position.opened_at).not.toBeNull();

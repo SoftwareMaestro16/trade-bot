@@ -90,6 +90,10 @@ interface ClosedPositionFixture {
   slippageCost?: string;
   /** Positive cost magnitude — defaults to "0" (no borrow, e.g. leverage=1). */
   borrowCost?: string;
+  /** Defaults to "__TEST_FIXTURE__" (no "=" -> parses to {} — see reportGenerator.ts's parseReasoningText), same as before this field existed. Pass a scenarioRunner.ts-shaped `key=value ...` string to exercise the narrative column / "Закономерности" aggregation. */
+  entryReasoning?: string;
+  /** Defaults to null (unset), same as before this field existed — scenarioRunner.ts's own `reasonCode=... ... detail=...` format. */
+  exitReasoning?: string;
 }
 
 async function insertClosedPosition(f: ClosedPositionFixture): Promise<bigint> {
@@ -102,11 +106,12 @@ async function insertClosedPosition(f: ClosedPositionFixture): Promise<bigint> {
       spot_qty: f.spotQty,
       perp_qty: f.perpQty,
       leverage: f.leverage,
-      entry_reasoning: "__TEST_FIXTURE__",
+      entry_reasoning: f.entryReasoning ?? "__TEST_FIXTURE__",
       opened_at: f.openedAt,
       closed_at: f.closedAt,
       slippage_cost: f.slippageCost ?? "0",
       borrow_cost: f.borrowCost ?? "0",
+      exit_reasoning: f.exitReasoning ?? null,
     })
     .returning("id")
     .executeTakeFirstOrThrow();
@@ -197,6 +202,48 @@ function csvLines(csv: string): string[] {
   return lines.slice(0, -1);
 }
 
+/**
+ * RFC-4180-aware field split (unlike the other tests' plain `.split(",")`,
+ * which only works because they only ever check fields BEFORE the new
+ * `narrative` column) — `narrative` routinely contains commas of its own, so
+ * reportGenerator.ts's own csvEscapeField quotes the whole field and doubles
+ * any embedded `"`; this undoes exactly that, respecting quoted fields.
+ */
+function parseCsvRow(line: string): string[] {
+  const fields: string[] = [];
+  let i = 0;
+  while (i <= line.length) {
+    if (line[i] === '"') {
+      let field = "";
+      i++;
+      while (i < line.length) {
+        if (line[i] === '"' && line[i + 1] === '"') {
+          field += '"';
+          i += 2;
+        } else if (line[i] === '"') {
+          i++;
+          break;
+        } else {
+          field += line[i];
+          i++;
+        }
+      }
+      fields.push(field);
+      i++; // skip the comma (or run past the end if this was the last field)
+    } else {
+      const nextComma = line.indexOf(",", i);
+      if (nextComma === -1) {
+        fields.push(line.slice(i));
+        i = line.length + 1;
+      } else {
+        fields.push(line.slice(i, nextComma));
+        i = nextComma + 1;
+      }
+    }
+  }
+  return fields;
+}
+
 // ---------------------------------------------------------------------------
 
 describe("generateReports", () => {
@@ -251,6 +298,7 @@ describe("generateReports", () => {
           "net_pnl_usd",
           "net_pnl_pct_of_notional",
           "result",
+          "narrative",
         ].join(","),
       );
       expect(tradeLines).toHaveLength(2); // header + 1 trade
@@ -681,4 +729,182 @@ describe("generateReports", () => {
 
     await expect(generateReports(db, "broken-run", [scenarioId])).rejects.toThrow(/expected 4 fills/);
   });
+
+  it(
+    "builds the trades.csv `narrative` column as one connected Russian sentence from " +
+      "entry_reasoning/exit_reasoning's scenarioRunner.ts-shaped key=value text plus this row's own already-" +
+      "computed P&L components — never inventing a figure not present in either source",
+    async () => {
+      const scenarioId = await insertScenario({ name: "Сценарий Нарратив", leverage: "1", startingDeposit: "500" });
+
+      const openedAt = new Date("2026-08-01T00:00:00.000Z");
+      const closedAt = new Date("2026-08-01T14:00:00.000Z"); // 14h hold
+
+      // Shaped exactly like scenarioRunner.ts's own openNewPosition/closePosition
+      // output (see that file + schema.ts's PaperPositionsTable doc comment) —
+      // r8h=0.0015 is 7.5x risk/economics.ts's ENTRY_FLOOR_R8H (0.0002), and
+      // lsrBuyRatio > lsrSellRatio (0.7 vs 0.3, ratio 2.33) is a long skew.
+      const entryReasoning =
+        "r8h=0.0015 apr=1.6425 basis=0 perpNotional=100 openInterest=5000000 lsrBuyRatio=0.7 lsrSellRatio=0.3";
+      const exitReasoning =
+        "reasonCode=FUNDING_TURNED_NEGATIVE r8hAtExit=-0.0001 aprAtExit=-0.1095 basisAtExit=0 " +
+        "exitPerpPrice=100 exitSpotPrice=100 heldHours=14.00 fundingPaymentsCollected=2 " +
+        "detail=Predicted next funding rate -0.0001 is negative (PARAMS-CONSERVATIVE.md §7.1).";
+
+      await insertClosedPosition({
+        scenarioId,
+        symbol: "__TEST_RPT_NARRATIVE__USDT",
+        leverage: "1",
+        spotQty: "1",
+        perpQty: "1",
+        openedAt,
+        closedAt,
+        entryPerpPrice: "100",
+        entryPerpFee: "0.01",
+        entrySpotPrice: "100",
+        entrySpotFee: "0.01",
+        exitPerpPrice: "100",
+        exitPerpFee: "0.01",
+        exitSpotPrice: "100",
+        exitSpotFee: "0.01",
+        fundingPayments: [
+          { amount: "1.5", paidAt: new Date("2026-08-01T04:00:00.000Z") },
+          { amount: "0.7", paidAt: new Date("2026-08-01T12:00:00.000Z") },
+        ],
+        entryReasoning,
+        exitReasoning,
+      });
+      await insertSnapshots(scenarioId, [
+        { at: openedAt, totalEquity: "500" },
+        { at: closedAt, totalEquity: "502.16" },
+      ]);
+
+      const result = await generateReports(db, "narrative-run", [scenarioId]);
+      const lines = csvLines(result.tradesCsv);
+      expect(lines).toHaveLength(2);
+      const fields = parseCsvRow(lines[1]!);
+      // header: ... net_pnl_pct_of_notional(14), result(15), narrative(16)
+      expect(fields).toHaveLength(17);
+      expect(fields[15]).toBe("win"); // funding 2.2 - fees 0.04 = net 2.16 > 0
+      const narrative = fields[16]!;
+
+      // Entry: funding rate framed against the entry floor (0.0015 / 0.0002 = 7.5x), long/short skew.
+      expect(narrative).toContain("Вход при funding 0.150%/8ч");
+      expect(narrative).toContain("в 7.5× выше порога входа 0.020%");
+      expect(narrative).toContain("long/short ratio 2.33 — перекос в лонги");
+
+      // Hold duration (TradeRow's own precise figure) + funding payment count (from exit_reasoning, correctly pluralized for n=2).
+      expect(narrative).toContain("Удержана 14.00ч, получено 2 выплаты funding.");
+
+      // Exit reason code translated to Russian prose.
+      expect(narrative).toContain("Закрыта по причине: разворота funding rate в отрицательную зону.");
+
+      // P&L: funding 1.5+0.7=2.2, basis 0 (omitted since zero), fees -0.04, net 2.16 — reusing already-computed TradeRow fields, not re-derived.
+      expect(narrative).toContain("Итог: +$2.16 (funding +$2.20, издержки -$0.04).");
+      expect(narrative).not.toContain("базис"); // zero basis P&L -> clause omitted, not shown as "+$0.00"
+    },
+  );
+
+  it(
+    "aggregates a run's own closed trades (across ALL its scenarios, reusing the same rows already read for " +
+      "trades.csv) into the summary markdown's \"Закономерности\" section: win rate by entry-r8h bucket, average " +
+      "hold duration for winners vs. losers, and exit-reason distribution with a per-reason win rate",
+    async () => {
+      const scenarioXId = await insertScenario({ name: "Паттерны X", leverage: "1", startingDeposit: "500" });
+      const scenarioYId = await insertScenario({ name: "Паттерны Y", leverage: "1", startingDeposit: "500" });
+
+      const baseFixture = {
+        leverage: "1",
+        spotQty: "1",
+        perpQty: "1",
+        entryPerpPrice: "100",
+        entryPerpFee: "0.01",
+        entrySpotPrice: "100",
+        entrySpotFee: "0.01",
+        exitPerpPrice: "100",
+        exitPerpFee: "0.01",
+        exitSpotPrice: "100",
+        exitSpotFee: "0.01",
+      };
+
+      // Trade 1 (scenario X): r8h=0.0008 (bucket "0.05–0.15%/8ч"), win, held 10h, APR_HYSTERESIS_TRIGGERED.
+      const t1Open = new Date("2026-09-01T00:00:00.000Z");
+      const t1Close = new Date("2026-09-01T10:00:00.000Z");
+      await insertClosedPosition({
+        ...baseFixture,
+        scenarioId: scenarioXId,
+        symbol: "__TEST_RPT_PAT_1__USDT",
+        openedAt: t1Open,
+        closedAt: t1Close,
+        fundingPayments: [{ amount: "5", paidAt: t1Open }], // net = 5 - 0.04 = 4.96 > 0 -> win
+        entryReasoning: "r8h=0.0008 apr=0.876 basis=0 perpNotional=100 openInterest=n/a lsrBuyRatio=n/a lsrSellRatio=n/a",
+        exitReasoning:
+          "reasonCode=APR_HYSTERESIS_TRIGGERED r8hAtExit=0.0003 aprAtExit=0.3285 basisAtExit=0 " +
+          "exitPerpPrice=100 exitSpotPrice=100 heldHours=10.00 fundingPaymentsCollected=1 detail=test fixture.",
+      });
+
+      // Trade 2 (scenario X): r8h=0.0009 (same bucket), win, held 20h, FUNDING_TURNED_NEGATIVE.
+      const t2Open = new Date("2026-09-02T00:00:00.000Z");
+      const t2Close = new Date("2026-09-02T20:00:00.000Z");
+      await insertClosedPosition({
+        ...baseFixture,
+        scenarioId: scenarioXId,
+        symbol: "__TEST_RPT_PAT_2__USDT",
+        openedAt: t2Open,
+        closedAt: t2Close,
+        fundingPayments: [{ amount: "3", paidAt: t2Open }], // net = 3 - 0.04 = 2.96 > 0 -> win
+        entryReasoning: "r8h=0.0009 apr=0.9855 basis=0 perpNotional=100 openInterest=n/a lsrBuyRatio=n/a lsrSellRatio=n/a",
+        exitReasoning:
+          "reasonCode=FUNDING_TURNED_NEGATIVE r8hAtExit=-0.0002 aprAtExit=-0.219 basisAtExit=0 " +
+          "exitPerpPrice=100 exitSpotPrice=100 heldHours=20.00 fundingPaymentsCollected=1 detail=test fixture.",
+      });
+
+      // Trade 3 (scenario Y): r8h=0.00085 (same bucket), loss (no funding at all), held 6h, APR_HYSTERESIS_TRIGGERED.
+      const t3Open = new Date("2026-09-03T00:00:00.000Z");
+      const t3Close = new Date("2026-09-03T06:00:00.000Z");
+      await insertClosedPosition({
+        ...baseFixture,
+        scenarioId: scenarioYId,
+        symbol: "__TEST_RPT_PAT_3__USDT",
+        openedAt: t3Open,
+        closedAt: t3Close,
+        // No fundingPayments -> net = 0 - 0.04 = -0.04 < 0 -> loss
+        entryReasoning: "r8h=0.00085 apr=0.93075 basis=0 perpNotional=100 openInterest=n/a lsrBuyRatio=n/a lsrSellRatio=n/a",
+        exitReasoning:
+          "reasonCode=APR_HYSTERESIS_TRIGGERED r8hAtExit=0.0001 aprAtExit=0.1095 basisAtExit=0 " +
+          "exitPerpPrice=100 exitSpotPrice=100 heldHours=6.00 fundingPaymentsCollected=0 detail=test fixture.",
+      });
+
+      await insertSnapshots(scenarioXId, [
+        { at: t1Open, totalEquity: "500" },
+        { at: t2Close, totalEquity: "507.92" },
+      ]);
+      await insertSnapshots(scenarioYId, [
+        { at: t3Open, totalEquity: "500" },
+        { at: t3Close, totalEquity: "499.96" },
+      ]);
+
+      const result = await generateReports(db, "patterns-run", [scenarioXId, scenarioYId]);
+      const md = result.summaryMarkdown;
+      expect(md).toContain("## Закономерности");
+
+      // (a) win rate by entry-r8h bucket: 2 wins + 1 loss, all in "0.05–0.15%/8ч" -> 3 trades, 2 wins, 66.7%.
+      expect(md).toContain("### Win rate по диапазону funding при входе (r8h)");
+      expect(md).toContain("| 3 | 2 | 66.7 |");
+      // The other two r8h buckets and the "no data" bucket got none of these 3 trades.
+      expect(md).toContain("| 0 | 0 | N/A |");
+
+      // (b) average hold duration, winners (10h, 20h -> avg 15.00) vs. losers (6h -> avg 6.00).
+      expect(md).toContain("### Средняя длительность удержания: прибыльные vs убыточные");
+      expect(md).toContain("| win | 2 | 15.00 |");
+      expect(md).toContain("| loss | 1 | 6.00 |");
+      expect(md).toContain("| breakeven | 0 | N/A |");
+
+      // (c) exit-reason distribution + win rate per reason: APR_HYSTERESIS_TRIGGERED (trade1 win + trade3 loss ->
+      // 2 trades, 1 win, 50.0%), FUNDING_TURNED_NEGATIVE (trade2 win only -> 1 trade, 1 win, 100.0%).
+      expect(md).toContain("### Распределение причин выхода");
+      expect(md).toContain("| APR_HYSTERESIS_TRIGGERED | 2 | 1 | 50.0 |");
+      expect(md).toContain("| FUNDING_TURNED_NEGATIVE | 1 | 1 | 100.0 |");
+    },
+  );
 });

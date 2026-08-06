@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import Big from "big.js";
 
 /**
@@ -48,6 +50,18 @@ import Big from "big.js";
  *    2026-08-06: source 4 covers tier-SELECTION mechanics, not this worked
  *    example. The numbers themselves were always correct; only the citation
  *    was wrong.
+ * 8. `src/emulation/marginTierData.json` — a full-universe companion to
+ *    source 6 above, not just the two hand-transcribed symbols. Produced by
+ *    `src/scripts/fetchMarginTierData.ts` (RISK-REGISTER.md FM-38), a one-off
+ *    script that walked the same `GET /v5/market/risk-limit` endpoint for
+ *    every symbol in market-data/universe.ts's tradeable universe (live
+ *    snapshot captured 2026-08-05/06, corrected 2026-08-06 for a global-vs-
+ *    per-symbol `id` numbering bug — see that script's own doc comment).
+ *    293/293 symbols covered, including BTCUSDT/ADAUSDT themselves (verified
+ *    byte-for-byte identical to KNOWN_MARGIN_TIERS's hand-transcribed rows).
+ *    `lookupMarginTier` below loads this file as `FETCHED_MARGIN_TIERS`, a
+ *    lower-priority source consulted only for symbols KNOWN_MARGIN_TIERS
+ *    doesn't itself cover — see that function's own doc comment.
  *
  * SCOPE — why this only ever prices the PERP leg, never "the pair":
  * PARAMS-CONSERVATIVE.md §6 / RR-25a fix the spot leg as bought outright with
@@ -241,10 +255,69 @@ const ADAUSDT_TIERS: readonly MarginTier[] = [
 ];
 
 /**
- * Symbols verified against a real, dated Bybit API snapshot. This is a small
- * subset of the ~293 USDT Perpetual symbols Bybit lists (backlog note: a full
- * pull of `GET /v5/market/risk-limit` for every symbol in market-data/universe.ts's
- * universe is real, separate follow-up work — see this task's open_questions).
+ * Decimal-string mirror of `MarginTier` — the shape each row of
+ * `marginTierData.json` is written in (see `MarginTierJson` in
+ * `src/scripts/fetchMarginTierData.ts`, which this type is kept in exact sync
+ * with by hand; it is not re-imported from that script to avoid a src/
+ * script -> src/emulation dependency edge for what is otherwise a one-off,
+ * manually-run tool). Every field is exactly what `buildTier` expects as a
+ * string argument.
+ */
+interface MarginTierJsonRow {
+  tier: number;
+  riskLimitValue: string;
+  maintenanceMarginRate: string;
+  initialMarginRate: string;
+  maxLeverage: string;
+  mmDeduction: string;
+  source: MarginTierSource;
+}
+
+/** See `process.cwd()` note on `FETCHED_MARGIN_TIERS`'s own doc comment for why this is resolved from cwd rather than `import.meta.url`. */
+const MARGIN_TIER_DATA_PATH = path.resolve(process.cwd(), "src/emulation/marginTierData.json");
+
+/**
+ * Reads and parses `marginTierData.json` once at module load, converting
+ * every row's decimal-string fields to `Big` via `buildTier` (same conversion
+ * `KNOWN_MARGIN_TIERS`'s own hardcoded tables go through). Not wrapped in a
+ * try/catch: this file is checked into the repo alongside this module (see
+ * this module's top-level doc comment, source 8) and is expected to always be
+ * present — a missing/corrupt file is a real environment problem that should
+ * fail loudly at import time, not be silently swallowed into an empty table
+ * (PROJECT.md ТАБУ #10, "ни одного проглоченного исключения" — the same
+ * no-silent-fallback stance `simulateForcedLiquidation`'s unsorted-ticks check
+ * takes elsewhere in this module).
+ */
+function loadFetchedMarginTiers(): MarginTierTable {
+  const raw = readFileSync(MARGIN_TIER_DATA_PATH, "utf8");
+  const parsed = JSON.parse(raw) as Record<string, readonly MarginTierJsonRow[]>;
+
+  const table: Record<string, readonly MarginTier[]> = {};
+  for (const [symbol, rows] of Object.entries(parsed)) {
+    table[symbol] = rows.map((row) =>
+      buildTier(
+        row.tier,
+        row.riskLimitValue,
+        row.maintenanceMarginRate,
+        row.initialMarginRate,
+        row.maxLeverage,
+        row.mmDeduction,
+        row.source,
+      ),
+    );
+  }
+  return table;
+}
+
+/**
+ * Symbols hand-transcribed and independently cross-checked against Bybit's
+ * own published worked examples (see this module's top-level doc comment,
+ * sources 4/7) — the two highest-confidence entries in the tier system, kept
+ * deliberately small and manually reviewed rather than folded into the
+ * larger, script-generated `FETCHED_MARGIN_TIERS` below. `lookupMarginTier`
+ * checks this table FIRST, so these two symbols' rows always win even though
+ * `FETCHED_MARGIN_TIERS` also (redundantly, and verified byte-for-byte
+ * identical) carries BTCUSDT/ADAUSDT — see that table's own doc comment.
  */
 export const KNOWN_MARGIN_TIERS: MarginTierTable = {
   BTCUSDT: BTCUSDT_TIERS,
@@ -252,9 +325,36 @@ export const KNOWN_MARGIN_TIERS: MarginTierTable = {
 };
 
 /**
- * Used by `lookupMarginTier` for any symbol not in KNOWN_MARGIN_TIERS. This is
- * NOT observed Bybit data for any real symbol — see MarginTier.source's own
- * doc comment for why that matters and what a caller should do about it.
+ * Full-universe margin-tier data loaded from `src/emulation/marginTierData.json`
+ * (this module's top-level doc comment, source 8) — every symbol
+ * `src/scripts/fetchMarginTierData.ts` was able to fetch from Bybit's live
+ * `GET /v5/market/risk-limit` endpoint, 293 symbols as of the 2026-08-05/06
+ * snapshot, keyed exactly like `KNOWN_MARGIN_TIERS`. Read synchronously at
+ * module load (this is a small, static, checked-in data file, not a runtime
+ * fetch — same "load once at import time" convention as this file's own
+ * hardcoded tier tables, just sourced from JSON instead of literal
+ * `buildTier` calls).
+ *
+ * The JSON path is resolved from `process.cwd()`, matching
+ * `fetchMarginTierData.ts`'s own `OUTPUT_PATH` convention (that script is
+ * documented to run from the repo root) — NOT from `import.meta.url`,
+ * because after a `tsc` build this module's compiled location moves under
+ * `dist/emulation/` while the data file stays at `src/emulation/`; resolving
+ * from `process.cwd()` finds it either way as long as the process is started
+ * from the repo root (true for `vitest`, `npm run build`-then-`node dist/...`,
+ * and this repo's other scripts alike).
+ *
+ * `lookupMarginTier` consults this table only for symbols `KNOWN_MARGIN_TIERS`
+ * (or the caller's own `table` argument) doesn't itself have — see that
+ * function's own doc comment for the full fallback order.
+ */
+export const FETCHED_MARGIN_TIERS: MarginTierTable = loadFetchedMarginTiers();
+
+/**
+ * Used by `lookupMarginTier` for any symbol not in KNOWN_MARGIN_TIERS or
+ * FETCHED_MARGIN_TIERS. This is NOT observed Bybit data for any real symbol —
+ * see MarginTier.source's own doc comment for why that matters and what a
+ * caller should do about it.
  *
  * Deliberately worse (higher MMR/IMR, therefore a liquidation price closer to
  * entry — less runway) than BOTH real tier-1 samples this file has verified:
@@ -293,12 +393,18 @@ export const FALLBACK_CONSERVATIVE_TIER: MarginTier = buildTier(
  * caller passes `qty.times(markPrice)` (or `.times(entryPrice)` for a
  * pre-trade estimate), not qty alone.
  *
- * Falls back to `FALLBACK_CONSERVATIVE_TIER` for any symbol not present in
- * `table` (default `KNOWN_MARGIN_TIERS`) — never throws for an unknown
- * symbol, matching this task's explicit instruction to hardcode a
- * conservative default rather than block on missing per-symbol data. Callers
- * that must not silently trade on a placeholder tier should check the
- * returned tier's `source` field themselves (see MarginTier.source).
+ * Looks a symbol up in two layers, in priority order: first `table` (default
+ * `KNOWN_MARGIN_TIERS`, the small hand-verified set), then — only if `table`
+ * doesn't have that symbol — `FETCHED_MARGIN_TIERS` (the full-universe,
+ * script-generated set; see that constant's own doc comment). This means a
+ * caller supplying a custom `table` (e.g. this module's own tests) still
+ * transparently gets full-universe coverage as a second layer underneath
+ * their override, exactly like the default call site does. Falls back to
+ * `FALLBACK_CONSERVATIVE_TIER` only when NEITHER layer has the symbol — never
+ * throws for an unknown symbol, matching this task's explicit instruction to
+ * hardcode a conservative default rather than block on missing per-symbol
+ * data. Callers that must not silently trade on a placeholder tier should
+ * check the returned tier's `source` field themselves (see MarginTier.source).
  *
  * When `positionNotional` exceeds every bracket in the symbol's own table,
  * clamps to the last (highest-risk) tier rather than throwing or
@@ -317,7 +423,7 @@ export function lookupMarginTier(
     throw new RangeError(`positionNotional must be positive, got ${positionNotional.toString()}`);
   }
 
-  const tiers = table[symbol];
+  const tiers = table[symbol] ?? FETCHED_MARGIN_TIERS[symbol];
   if (tiers === undefined || tiers.length === 0) {
     return FALLBACK_CONSERVATIVE_TIER;
   }

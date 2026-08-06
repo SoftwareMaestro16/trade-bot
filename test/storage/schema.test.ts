@@ -46,6 +46,10 @@ const PAPER_TABLES_SQL = readFileSync(
   path.join(migrationsDir, "1786044239655_create-paper-trading-tables.sql"),
   "utf8",
 );
+const PAPER_POSITIONS_EXIT_REASONING_SQL = readFileSync(
+  path.join(migrationsDir, "1786055157851_add-paper-positions-exit-reasoning.sql"),
+  "utf8",
+);
 
 /**
  * Pulls the exact column names a `CREATE TABLE <name> ( ... );` block declares
@@ -83,6 +87,24 @@ function extractColumnNames(sql: string, tableName: string): string[] {
     if (constraintKeyword.test(trimmed)) continue;
     const columnName = columnLine.exec(trimmed)?.[1];
     if (columnName) columns.push(columnName);
+  }
+  return columns;
+}
+
+/**
+ * Pulls column names added by `ALTER TABLE <name> ADD COLUMN <col> ...;` lines
+ * — this repo's convention for a column added after a table's initial
+ * CREATE TABLE (see migrations/1786055157851_add-paper-positions-exit-reasoning.sql)
+ * — so a later ALTER migration stays covered by the same mirror-proof as the
+ * originating CREATE TABLE block extracted by extractColumnNames above.
+ */
+function extractAlterAddedColumns(sql: string, tableName: string): string[] {
+  const pattern = new RegExp(`ALTER TABLE\\s+${tableName}\\s+ADD COLUMN\\s+([a-z_][a-z0-9_]*)`, "gi");
+  const columns: string[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(sql)) !== null) {
+    const name = match[1];
+    if (name) columns.push(name);
   }
   return columns;
 }
@@ -251,8 +273,13 @@ describe("storage/schema.ts mirrors migrations/*.sql exactly (structural check, 
         closed_at: null,
         slippage_cost: null,
         borrow_cost: null,
+        exit_reasoning: null,
       };
-      expect(sorted(Object.keys(sample))).toEqual(sorted(extractColumnNames(PAPER_TABLES_SQL, "paper_positions")));
+      const columns = [
+        ...extractColumnNames(PAPER_TABLES_SQL, "paper_positions"),
+        ...extractAlterAddedColumns(PAPER_POSITIONS_EXIT_REASONING_SQL, "paper_positions"),
+      ];
+      expect(sorted(Object.keys(sample))).toEqual(sorted(columns));
     });
 
     it("paper_fills", () => {

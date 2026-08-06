@@ -110,6 +110,40 @@ const REALITY_ADJUST_HIGH = new Big("0.7");
 
 const MS_PER_HOUR = 1000 * 60 * 60;
 
+/**
+ * risk/economics.ts's ENTRY_FLOOR_R8H (0.020%/8h — "never 0.010%",
+ * PARAMS-CONSERVATIVE.md §5, checkEntryThreshold's floor gate) — not exported
+ * from that module, so duplicated here on purpose, same convention as
+ * ENTRY_GROSS_MULTIPLIER above. Used only for the narrative CSV column's "N×
+ * above the entry floor" framing and the summary's r8h buckets below — never
+ * re-derives or re-checks an actual entry decision.
+ */
+const ENTRY_FLOOR_R8H = new Big("0.0002");
+
+/** strategy/exitRules.ts / scenarioRunner.ts's closePosition reasonCode values, translated for the narrative column and the "Закономерности" section. An unrecognized code (future exitRules.ts addition) falls back to the raw code untranslated — see buildNarrative/exitReasonForTrade. */
+// "по причине" governs the genitive case (like "из-за") — every phrase below
+// must be genitive, not dative. FORCED_LIQUIDATION's "ликвидации" is correct
+// either way (soft feminine -ия nouns share one form across genitive/dative/
+// prepositional singular), which is what let the other five slip through.
+const EXIT_REASON_RU: Record<string, string> = {
+  FUNDING_TURNED_NEGATIVE: "разворота funding rate в отрицательную зону",
+  APR_HYSTERESIS_TRIGGERED: "падения текущего APR ниже порога гистерезиса от APR входа",
+  BASIS_DIVERGED: "экстренного расхождения базиса сверх аварийного порога",
+  DELISTED_OR_CONTRACT_CHANGED: "делистинга или смены параметров контракта",
+  FORCED_LIQUIDATION: "принудительной ликвидации перп-ноги",
+  SCENARIO_END: "окончания периода сценария (позиция оставалась открытой)",
+};
+
+/** Fixed r8h buckets for the "Закономерности" win-rate-by-entry-funding table — boundaries per owner's own spec, the lower one reusing ENTRY_FLOOR_R8H above. */
+const R8H_BUCKETS: { label: string; min: Big; max: Big | undefined }[] = [
+  { label: "0.02–0.05%/8ч", min: ENTRY_FLOOR_R8H, max: new Big("0.0005") },
+  { label: "0.05–0.15%/8ч", min: new Big("0.0005"), max: new Big("0.0015") },
+  { label: "выше 0.15%/8ч", min: new Big("0.0015"), max: undefined },
+];
+
+/** A trade whose entry_reasoning has no parseable `r8h=` field (e.g. pre-this-feature data) — grouped separately rather than silently dropped or mis-bucketed. */
+const NO_R8H_DATA_BUCKET_LABEL = "нет данных о funding при входе";
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -149,6 +183,10 @@ interface TradeRow {
   netPnlUsd: Big;
   netPnlPctOfNotional: Big;
   result: "win" | "loss" | "breakeven";
+  /** paper_positions.entry_reasoning, parsed as `key=value` pairs — see parseReasoningText. Empty object if null/unparseable (e.g. pre-this-feature fixture text). */
+  entryContext: Record<string, string>;
+  /** paper_positions.exit_reasoning, parsed the same way — `detail` (if present) is always the LAST key, its value the free-text remainder of the string. */
+  exitContext: Record<string, string>;
 }
 
 interface EquitySnapshotPoint {
@@ -177,6 +215,51 @@ function utcDate(d: Date): string {
 
 function bigSum(values: Big[]): Big {
   return values.reduce((acc, v) => acc.plus(v), new Big(0));
+}
+
+/**
+ * Parses scenarioRunner.ts's `entry_reasoning`/`exit_reasoning` free-text
+ * format (`key1=value1 key2=value2 ... detail=free text sentence`, see that
+ * file's openNewPosition/closePosition) into a plain lookup. Every key except
+ * `detail` has a single non-space token as its value (a Big decimal string,
+ * "n/a", or a bare code) so a greedy `key=token` scan is enough; `detail`,
+ * when present, is always the LAST key and its value runs to the end of the
+ * string (a full human sentence, which may itself contain spaces) — handled
+ * as a special case rather than by the same per-token regex.
+ *
+ * Returns `{}` for null/empty text, or for text with no `key=value` pairs at
+ * all (e.g. older fixtures/rows that predate this format) — callers must
+ * treat every field as optional, never assume a key is present.
+ */
+function parseReasoningText(text: string | null): Record<string, string> {
+  if (!text) return {};
+  const detailMarker = "detail=";
+  const detailIdx = text.indexOf(detailMarker);
+  const head = detailIdx === -1 ? text : text.slice(0, detailIdx);
+  const fields: Record<string, string> = {};
+  for (const match of head.matchAll(/(\S+?)=(\S*)/g)) {
+    fields[match[1]!] = match[2]!;
+  }
+  if (detailIdx !== -1) {
+    fields.detail = text.slice(detailIdx + detailMarker.length);
+  }
+  return fields;
+}
+
+/**
+ * Reads a parsed entry_reasoning/exit_reasoning field as a Big, or undefined
+ * if absent/"n/a"/unparseable. Shared by buildNarrative (per-trade CSV
+ * column) and the "Закономерности" aggregation below — never throws, since
+ * both callers treat a missing/malformed field as "no data", not an error.
+ */
+function parseContextBig(context: Record<string, string>, key: string): Big | undefined {
+  const raw = context[key];
+  if (raw === undefined || raw === "n/a") return undefined;
+  try {
+    return new Big(raw);
+  } catch {
+    return undefined;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +322,8 @@ function buildTradeRow(
     closed_at: Date | null;
     slippage_cost: string | null;
     borrow_cost: string | null;
+    entry_reasoning: string | null;
+    exit_reasoning: string | null;
   },
   fills: { leg: "spot" | "perp"; side: string; qty: string; price: string; fee: string; executed_at: Date }[],
   fundingPayments: { amount: string }[],
@@ -334,6 +419,8 @@ function buildTradeRow(
     netPnlUsd,
     netPnlPctOfNotional,
     result,
+    entryContext: parseReasoningText(position.entry_reasoning),
+    exitContext: parseReasoningText(position.exit_reasoning),
   };
 }
 
@@ -459,6 +546,95 @@ interface ScenarioSummary {
   snapshots: EquitySnapshotPoint[];
 }
 
+// ---------------------------------------------------------------------------
+// "Закономерности" — aggregated cross-scenario patterns (summary markdown)
+// ---------------------------------------------------------------------------
+//
+// Pure aggregation over the SAME TradeRow[] already read for the trades CSV
+// (see generateReports' orchestrator — no separate DB query issued here).
+
+/** Which fixed r8h_BUCKETS label a trade's parsed entry r8h falls into, or NO_R8H_DATA_BUCKET_LABEL if entry_reasoning had no parseable `r8h=` field. A value below the lowest bucket's floor (not expected given the live entry gate, but this reads historical text, not a re-validated number) is grouped with that lowest bucket rather than invented a new one. */
+function bucketForEntryR8h(trade: TradeRow): string {
+  const r8h = parseContextBig(trade.entryContext, "r8h");
+  if (r8h === undefined) return NO_R8H_DATA_BUCKET_LABEL;
+  for (const bucket of R8H_BUCKETS) {
+    if (r8h.gte(bucket.min) && (bucket.max === undefined || r8h.lt(bucket.max))) return bucket.label;
+  }
+  return R8H_BUCKETS[0]!.label;
+}
+
+const NO_EXIT_REASON_DATA_LABEL = "нет данных о причине выхода";
+
+/** The raw reasonCode from exit_reasoning (BASIS_DIVERGED, FORCED_LIQUIDATION, ...) — NOT translated here, unlike buildNarrative's prose, so the table groups/sorts on the stable machine code. */
+function exitReasonForTrade(trade: TradeRow): string {
+  return trade.exitContext.reasonCode ?? NO_EXIT_REASON_DATA_LABEL;
+}
+
+/** "N/A" (not "0" or a division-by-zero NaN) when there are no trades to rate. */
+function formatWinRatePct(wins: number, total: number): string {
+  return total === 0 ? "N/A" : new Big(wins).div(total).times(100).toFixed(1);
+}
+
+/** "N/A" when the group is empty — same reasoning as formatWinRatePct. */
+function formatAvgHours(trades: TradeRow[]): string {
+  if (trades.length === 0) return "N/A";
+  return bigSum(trades.map((t) => t.holdDurationHours)).div(trades.length).toFixed(2);
+}
+
+/**
+ * Design spec (owner's ask): (a) win rate by entry-r8h bucket, (b) average
+ * hold duration for winning vs. losing trades, (c) exit-reason distribution
+ * with a win rate per reason. Pure aggregation over `allTrades` — the same
+ * TradeRow[] already assembled for the trades CSV, no new DB read.
+ */
+function buildPatternsSection(allTrades: TradeRow[]): string[] {
+  const lines: string[] = ["", "## Закономерности"];
+
+  if (allTrades.length === 0) {
+    lines.push(
+      "",
+      "_Нет закрытых сделок ни в одном сценарии этого прогона — агрегированные закономерности недоступны._",
+    );
+    return lines;
+  }
+
+  // (a) win rate by entry r8h bucket
+  lines.push("", "### Win rate по диапазону funding при входе (r8h)", "");
+  lines.push("| Диапазон r8h | Сделок | Побед | Win rate, % |");
+  lines.push("| --- | --- | --- | --- |");
+  for (const label of [...R8H_BUCKETS.map((b) => b.label), NO_R8H_DATA_BUCKET_LABEL]) {
+    const trades = allTrades.filter((t) => bucketForEntryR8h(t) === label);
+    const wins = trades.filter((t) => t.result === "win").length;
+    lines.push(
+      `| ${mdEscape(label)} | ${String(trades.length)} | ${String(wins)} | ${formatWinRatePct(wins, trades.length)} |`,
+    );
+  }
+
+  // (b) average hold duration, winning vs. losing trades
+  lines.push("", "### Средняя длительность удержания: прибыльные vs убыточные", "");
+  lines.push("| Результат | Сделок | Средняя длительность, ч |");
+  lines.push("| --- | --- | --- |");
+  for (const result of ["win", "loss", "breakeven"] as const) {
+    const trades = allTrades.filter((t) => t.result === result);
+    lines.push(`| ${result} | ${String(trades.length)} | ${formatAvgHours(trades)} |`);
+  }
+
+  // (c) exit-reason distribution + win rate per reason
+  lines.push("", "### Распределение причин выхода", "");
+  lines.push("| Причина выхода | Сделок | Побед | Win rate, % |");
+  lines.push("| --- | --- | --- | --- |");
+  const reasons = [...new Set(allTrades.map((t) => exitReasonForTrade(t)))].sort();
+  for (const reason of reasons) {
+    const trades = allTrades.filter((t) => exitReasonForTrade(t) === reason);
+    const wins = trades.filter((t) => t.result === "win").length;
+    lines.push(
+      `| ${mdEscape(reason)} | ${String(trades.length)} | ${String(wins)} | ${formatWinRatePct(wins, trades.length)} |`,
+    );
+  }
+
+  return lines;
+}
+
 function buildSummaryMarkdown(runId: string, summaries: ScenarioSummary[]): string {
   const header = [
     "scenario_order",
@@ -533,6 +709,8 @@ function buildSummaryMarkdown(runId: string, summaries: ScenarioSummary[]): stri
     ];
   });
 
+  const allTrades = summaries.flatMap((s) => s.trades);
+
   const lines = [
     `# Paper-trading report — run ${runId}`,
     "",
@@ -543,8 +721,106 @@ function buildSummaryMarkdown(runId: string, summaries: ScenarioSummary[]): stri
     "_fees_usd / slippage_usd / borrow_cost_usd are costs, reported <= 0 (same convention as " +
       "execution/realizedPnl.ts's RealizedPnlBreakdown) — net_pnl_usd is the plain sum of every component " +
       "column on the row._",
+    ...buildPatternsSection(allTrades),
   ];
   return lines.join("\n") + "\n";
+}
+
+// ---------------------------------------------------------------------------
+// Narrative (human-readable causality) — trades.csv's `narrative` column
+// ---------------------------------------------------------------------------
+//
+// Built ONLY from (a) paper_positions.entry_reasoning/exit_reasoning, parsed
+// via parseReasoningText, and (b) this file's own already-computed TradeRow
+// P&L components — never a fabricated figure. Any field missing from the
+// parsed context (older data, a field that legitimately wasn't collected yet
+// at that instant — see scenarioRunner.ts's openInterest/longShortRatio doc
+// comments) simply drops that clause from the sentence rather than guessing.
+
+/** `0.0015` -> "0.150%" (fraction -> percent string, fixed decimals). */
+function pctStr(fraction: Big, decimals: number): string {
+  return `${fraction.times(100).toFixed(decimals)}%`;
+}
+
+/** `-0.9` -> "-$0.90", `4.1` -> "+$4.10" — sign always explicit, so a reader never has to infer cost vs. income from context. */
+function usdStr(amount: Big): string {
+  const sign = amount.gte(0) ? "+" : "-";
+  return `${sign}$${amount.abs().toFixed(2)}`;
+}
+
+/** Russian noun pluralization (1 -> one, 2-4 -> few, 5-20/0/5-9 -> many), standard genitive-count rule including the 11-14 exception. */
+function ruPlural(n: number, one: string, few: string, many: string): string {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod100 >= 11 && mod100 <= 14) return many;
+  if (mod10 === 1) return one;
+  if (mod10 >= 2 && mod10 <= 4) return few;
+  return many;
+}
+
+/**
+ * One connected Russian sentence per closed trade, assembled from
+ * entry_reasoning (funding rate + long/short skew at entry),
+ * exit_reasoning (hold duration's funding-payment count, exit reason code),
+ * and this row's own already-computed P&L components (funding/basis/costs/
+ * net). Designed for `paper_trades_<run_id>.csv`'s `narrative` column — see
+ * module doc comment.
+ */
+function buildNarrative(trade: TradeRow): string {
+  const sentences: string[] = [];
+
+  // --- Entry: funding rate (vs. the entry floor) + long/short skew ---
+  const entryParts: string[] = [];
+  const entryR8h = parseContextBig(trade.entryContext, "r8h");
+  if (entryR8h !== undefined) {
+    let clause = `Вход при funding ${pctStr(entryR8h, 3)}/8ч`;
+    if (entryR8h.gt(0)) {
+      const multiple = entryR8h.div(ENTRY_FLOOR_R8H);
+      clause += ` (в ${multiple.toFixed(1)}× выше порога входа ${pctStr(ENTRY_FLOOR_R8H, 3)})`;
+    }
+    entryParts.push(clause);
+  }
+  const buyRatio = parseContextBig(trade.entryContext, "lsrBuyRatio");
+  const sellRatio = parseContextBig(trade.entryContext, "lsrSellRatio");
+  if (buyRatio !== undefined && sellRatio !== undefined) {
+    if (buyRatio.gt(sellRatio) && sellRatio.gt(0)) {
+      entryParts.push(`long/short ratio ${buyRatio.div(sellRatio).toFixed(2)} — перекос в лонги`);
+    } else if (sellRatio.gt(buyRatio) && buyRatio.gt(0)) {
+      entryParts.push(`long/short ratio ${sellRatio.div(buyRatio).toFixed(2)} — перекос в шорты`);
+    } else if (buyRatio.eq(sellRatio)) {
+      entryParts.push("long/short ratio без выраженного перекоса");
+    }
+  }
+  if (entryParts.length > 0) sentences.push(entryParts.join(", ") + ".");
+
+  // --- Hold duration (TradeRow's own precise figure, not exit_reasoning's rounded text copy) + funding payment count ---
+  const holdClause = `Удержана ${trade.holdDurationHours.toFixed(2)}ч`;
+  const fundingPaymentsRaw = trade.exitContext.fundingPaymentsCollected;
+  const fundingPaymentsCount = fundingPaymentsRaw !== undefined ? Number.parseInt(fundingPaymentsRaw, 10) : undefined;
+  if (fundingPaymentsCount !== undefined && Number.isFinite(fundingPaymentsCount)) {
+    const noun = ruPlural(fundingPaymentsCount, "выплата", "выплаты", "выплат");
+    sentences.push(`${holdClause}, получено ${String(fundingPaymentsCount)} ${noun} funding.`);
+  } else {
+    sentences.push(`${holdClause}.`);
+  }
+
+  // --- Exit reason ---
+  const reasonCode = trade.exitContext.reasonCode;
+  if (reasonCode !== undefined) {
+    const ruReason = EXIT_REASON_RU[reasonCode] ?? reasonCode;
+    const liquidationPrice = parseContextBig(trade.exitContext, "liquidationPrice");
+    const priceClause = liquidationPrice !== undefined ? ` (цена ликвидации $${liquidationPrice.toFixed(2)})` : "";
+    sentences.push(`Закрыта по причине: ${ruReason}${priceClause}.`);
+  }
+
+  // --- P&L breakdown, reusing this row's own already-computed components ---
+  const costs = trade.feesUsd.plus(trade.slippageUsd).plus(trade.borrowCostUsd);
+  const pnlParts = [`funding ${usdStr(trade.fundingUsd)}`];
+  if (!trade.basisPnlUsd.eq(0)) pnlParts.push(`базис ${usdStr(trade.basisPnlUsd)}`);
+  pnlParts.push(`издержки ${usdStr(costs)}`);
+  sentences.push(`Итог: ${usdStr(trade.netPnlUsd)} (${pnlParts.join(", ")}).`);
+
+  return sentences.join(" ");
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +867,7 @@ function buildTradesCsv(summaries: ScenarioSummary[]): string {
     "net_pnl_usd",
     "net_pnl_pct_of_notional",
     "result",
+    "narrative",
   ];
 
   const rows = summaries.flatMap(({ trades }) =>
@@ -611,6 +888,7 @@ function buildTradesCsv(summaries: ScenarioSummary[]): string {
       t.netPnlUsd.toString(),
       t.netPnlPctOfNotional.toString(),
       t.result,
+      buildNarrative(t),
     ]),
   );
 

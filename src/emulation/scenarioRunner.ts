@@ -200,6 +200,11 @@ interface SettledFunding {
   fundingTimestampMs: number;
 }
 
+interface LongShortRatioSnapshot {
+  buyRatio: Big;
+  sellRatio: Big;
+}
+
 interface CandidateEvaluation {
   symbol: string;
   r8h: Big;
@@ -212,6 +217,10 @@ interface CandidateEvaluation {
   entryPerpSlippageBp: Big;
   tier: MarginTier;
   legNotional: Big;
+  /** Context-only, for entry_reasoning — never gates the veto (see evaluateCandidate). Undefined if no OI collected yet at/before t. */
+  openInterest: Big | undefined;
+  /** Context-only, for entry_reasoning — never gates the veto. Undefined if no long/short-ratio row collected yet at/before t. */
+  longShortRatio: LongShortRatioSnapshot | undefined;
 }
 
 interface OpenPositionState {
@@ -227,6 +236,8 @@ interface OpenPositionState {
   entryFees: Big;
   entrySpotSlippageBp: Big;
   entryPerpSlippageBp: Big;
+  /** t.getTime() at open — fixed for the position's lifetime, unlike fundingAppliedThroughMs/lastBorrowAccrualMs below (both mutate as ticks pass). Used to compute hold duration for exit_reasoning. */
+  openedAtMs: number;
   fundingAppliedThroughMs: number;
   fundingAccrued: Big;
   fundingPaymentsCollected: number;
@@ -355,6 +366,46 @@ async function orderbookSideAtOrBefore(
   return rows.map((r) => ({ price: new Big(r.price), qty: new Big(r.qty) }));
 }
 
+/**
+ * Context-only market data for entry_reasoning (owner's ask, 2026-08-06: "что
+ * происходило на рынке" at decision time) — same `fetched_at <= t` gate as
+ * every other read in this file, but unlike latestPredictedFundingAtOrBefore
+ * a missing row here does NOT veto the candidate: open_interest is collected
+ * separately from tickers/funding_rates (collectOpenInterest.ts) and can
+ * simply not have run yet for a given symbol/instant without that meaning
+ * anything about whether the trade itself is sound.
+ */
+async function latestOpenInterestAtOrBefore(db: Kysely<Database>, symbol: string, t: Date): Promise<Big | undefined> {
+  const row = await db
+    .selectFrom("open_interest")
+    .selectAll()
+    .where("symbol", "=", symbol)
+    .where("fetched_at", "<=", t)
+    .orderBy("fetched_at", "desc")
+    .limit(1)
+    .executeTakeFirst();
+  if (!row) return undefined;
+  return new Big(row.open_interest);
+}
+
+/** Context-only, same reasoning as latestOpenInterestAtOrBefore above — collectLongShortRatio.ts's own sweep, never a veto input. */
+async function latestLongShortRatioAtOrBefore(
+  db: Kysely<Database>,
+  symbol: string,
+  t: Date,
+): Promise<LongShortRatioSnapshot | undefined> {
+  const row = await db
+    .selectFrom("long_short_ratio")
+    .selectAll()
+    .where("symbol", "=", symbol)
+    .where("fetched_at", "<=", t)
+    .orderBy("fetched_at", "desc")
+    .limit(1)
+    .executeTakeFirst();
+  if (!row) return undefined;
+  return { buyRatio: new Big(row.buy_ratio), sellRatio: new Big(row.sell_ratio) };
+}
+
 // ---------------------------------------------------------------------------
 // Candidate evaluation (entry side)
 // ---------------------------------------------------------------------------
@@ -456,6 +507,14 @@ async function evaluateCandidate(
     return undefined;
   }
 
+  // Context-only market data for entry_reasoning — fetched only once the
+  // candidate has actually cleared the veto, so a symbol that gets rejected
+  // (the common case, most ticks) doesn't pay for two more queries it will
+  // never use. See latestOpenInterestAtOrBefore/latestLongShortRatioAtOrBefore
+  // doc comments: neither can veto a candidate, only describe it.
+  const openInterest = await latestOpenInterestAtOrBefore(db, symbol, t);
+  const longShortRatio = await latestLongShortRatioAtOrBefore(db, symbol, t);
+
   return {
     symbol,
     r8h,
@@ -468,6 +527,8 @@ async function evaluateCandidate(
     entryPerpSlippageBp: entryPerpSlip.slippageBp,
     tier,
     legNotional: projectedShortNotional,
+    openInterest,
+    longShortRatio,
   };
 }
 
@@ -485,11 +546,23 @@ async function pickBestCandidate(
   availableEquity: Big,
   sizeFraction: Big,
 ): Promise<CandidateEvaluation | undefined> {
-  const passing: CandidateEvaluation[] = [];
-  for (const symbol of resolved.symbols) {
-    const evaluation = await evaluateCandidate(db, resolved, symbol, t, availableEquity, sizeFraction);
-    if (evaluation) passing.push(evaluation);
-  }
+  // Evaluated concurrently, not one-symbol-at-a-time: evaluateCandidate is a
+  // pure read (no shared mutable state, no cross-symbol ordering dependency —
+  // pickBestCandidate ranks the full `passing` set afterward regardless of
+  // arrival order), so a sequential for-await loop here was paying one full
+  // network round-trip's latency per symbol per query for no correctness
+  // benefit. At real-universe scale (~300 symbols x up to 5 queries each
+  // before a veto decision) that made a full scenario run over even one day
+  // of data impractically slow (confirmed live: minutes per tick, sequential,
+  // vs. sub-second once parallelized) — found running the first real-data
+  // preliminary emulation (2026-08-06), not caught by any test fixture, which
+  // only ever use a handful of symbols. Bounded implicitly by the `db` pool's
+  // own connection limit (pg.Pool default max=10, storage/db.ts) — excess
+  // queries queue on the pool rather than opening unbounded connections.
+  const evaluations = await Promise.all(
+    resolved.symbols.map((symbol) => evaluateCandidate(db, resolved, symbol, t, availableEquity, sizeFraction)),
+  );
+  const passing: CandidateEvaluation[] = evaluations.filter((e): e is CandidateEvaluation => e !== undefined);
   if (passing.length === 0) return undefined;
 
   const ranked = rankCandidates(
@@ -525,7 +598,10 @@ async function openNewPosition(
       leverage: resolved.leverage.toString(),
       entry_reasoning:
         `r8h=${cand.r8h.toString()} apr=${r8hToApr(cand.r8h).toString()} ` +
-        `basis=${cand.currentBasis.toString()} perpNotional=${cand.legNotional.toString()}`,
+        `basis=${cand.currentBasis.toString()} perpNotional=${cand.legNotional.toString()} ` +
+        `openInterest=${cand.openInterest?.toString() ?? "n/a"} ` +
+        `lsrBuyRatio=${cand.longShortRatio?.buyRatio.toString() ?? "n/a"} ` +
+        `lsrSellRatio=${cand.longShortRatio?.sellRatio.toString() ?? "n/a"}`,
       opened_at: t,
       closed_at: null, // explicit, though Kysely already treats a nullable plain field as optional at insert
     })
@@ -584,6 +660,7 @@ async function openNewPosition(
     entryFees: spotFee.plus(perpFee),
     entrySpotSlippageBp: cand.entrySpotSlippageBp,
     entryPerpSlippageBp: cand.entryPerpSlippageBp,
+    openedAtMs: t.getTime(),
     fundingAppliedThroughMs: t.getTime(),
     fundingAccrued: new Big(0),
     fundingPaymentsCollected: 0,
@@ -637,7 +714,15 @@ function accrueBorrowCost(pos: OpenPositionState, t: Date, perpMarkPrice: Big, r
   pos.lastBorrowAccrualMs = t.getTime();
 }
 
-/** Closes the position, journals the exit fills, and returns the cash (initialCapital + realizedPnl - borrowCost) to return to the caller's idle-cash pool. */
+/**
+ * Closes the position, journals the exit fills, and returns the cash
+ * (initialCapital + realizedPnl - borrowCost) to return to the caller's
+ * idle-cash pool. `reasonDetail` is a human-readable sentence explaining WHY
+ * (owner's own words, 2026-08-06: "что, почему, из-за чего") — every call
+ * site supplies one: strategy/exitRules.ts's own ExitDecision.reason for a
+ * planned/emergency exit, or an explicit sentence for the two reasons that
+ * don't come from checkExit (FORCED_LIQUIDATION, SCENARIO_END).
+ */
 async function closePosition(
   db: Kysely<Database>,
   pos: OpenPositionState,
@@ -645,6 +730,7 @@ async function closePosition(
   exitPerpPrice: Big,
   exitSpotPrice: Big,
   reasonCode: string,
+  reasonDetail: string,
   resolved: ResolvedScenarioConfig,
 ): Promise<Big> {
   const exitPerpFee = pos.perpQty.times(exitPerpPrice).times(resolved.perpTakerFeeRate);
@@ -685,6 +771,25 @@ async function closePosition(
     .times(pos.perpEntryPrice.plus(exitPerpPrice))
     .plus(pos.entrySpotSlippageBp.times(pos.spotQty).times(pos.spotEntryPrice.plus(exitSpotPrice)));
 
+  // Exit-time funding context for exit_reasoning — same latestPredictedFundingAtOrBefore
+  // helper (and the same `fetched_at <= t` look-ahead gate) checkExit's own
+  // predictedNextFundingRate input was built from, re-read here rather than
+  // threaded through every call site so FORCED_LIQUIDATION/SCENARIO_END (which
+  // never call checkExit at all) get the same context a planned exit does.
+  const predictedAtExit = await latestPredictedFundingAtOrBefore(db, pos.symbol, t);
+  const r8hAtExit = predictedAtExit
+    ? normalizeFundingRateToR8h(predictedAtExit.rate, predictedAtExit.intervalMinutes)
+    : undefined;
+  const heldHours = ((t.getTime() - pos.openedAtMs) / (60 * 60 * 1000)).toFixed(2);
+
+  const exitReasoning =
+    `reasonCode=${reasonCode} r8hAtExit=${r8hAtExit?.toString() ?? "n/a"} ` +
+    `aprAtExit=${r8hAtExit ? r8hToApr(r8hAtExit).toString() : "n/a"} basisAtExit=${exitBasis.toString()} ` +
+    `exitPerpPrice=${exitPerpPrice.toString()} exitSpotPrice=${exitSpotPrice.toString()} ` +
+    `heldHours=${heldHours} fundingPaymentsCollected=${String(pos.fundingPaymentsCollected)}` +
+    (reasonCode === "FORCED_LIQUIDATION" ? ` liquidationPrice=${exitPerpPrice.toString()}` : "") +
+    ` detail=${reasonDetail}`;
+
   // Persisted here (not just kept in-memory) so reportGenerator.ts can read back
   // the real per-trade cost instead of reporting an upper-bound net_pnl_usd —
   // see schema.ts's PaperPositionsTable doc comment for the stored sign convention.
@@ -695,6 +800,7 @@ async function closePosition(
       closed_at: t,
       slippage_cost: slippageCost.toString(),
       borrow_cost: pos.borrowCostAccrued.toString(),
+      exit_reasoning: exitReasoning,
     })
     .where("id", "=", pos.id)
     .execute();
@@ -763,6 +869,8 @@ async function processOpenPositionTick(
       pos.perpBankruptcyPrice,
       spotPrice,
       "FORCED_LIQUIDATION",
+      "Perp leg forced-liquidated: emulation/liquidation.ts's simulateDeltaNeutralForcedLiquidation found this " +
+        "tick's mark price breached the simulated maintenance-margin/bankruptcy threshold for the position's tier.",
       resolved,
     );
     return { closed: true, cashReturned, forced: true };
@@ -781,7 +889,16 @@ async function processOpenPositionTick(
       fundingPaymentsCollected: pos.fundingPaymentsCollected,
     });
     if (exitDecision.shouldExit) {
-      const cashReturned = await closePosition(db, pos, t, perpMarkPrice, spotPrice, exitDecision.code, resolved);
+      const cashReturned = await closePosition(
+        db,
+        pos,
+        t,
+        perpMarkPrice,
+        spotPrice,
+        exitDecision.code,
+        exitDecision.reason,
+        resolved,
+      );
       return { closed: true, cashReturned, forced: false };
     }
   }
@@ -952,6 +1069,8 @@ async function executeScenario(
         perpExitPrice,
         spotExitPrice,
         "SCENARIO_END",
+        "Scenario date range ended with the position still open — force-closed at the last tick so no paper " +
+          "position outlives its own run (never a strategy or risk decision).",
         resolved,
       );
       closedTradeHistory.push({

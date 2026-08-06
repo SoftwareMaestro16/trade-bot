@@ -249,7 +249,9 @@ export interface HaltStateTable {
 }
 
 // ---------------------------------------------------------------------------
-// migrations/1786044239655_create-paper-trading-tables.sql (Фаза 2 эмуляция).
+// migrations/1786044239655_create-paper-trading-tables.sql (Фаза 2 эмуляция)
+// + migrations/1786055157851_add-paper-positions-exit-reasoning.sql (adds
+// paper_positions.exit_reasoning, symmetric to entry_reasoning below).
 // Deliberately separate paper_*-tables, not an `is_virtual` flag on
 // positions/orders/fills above — see that migration's own docstring: those
 // real tables fix `order_link_id`/`exec_id` as NOT NULL UNIQUE specifically
@@ -289,6 +291,12 @@ export interface PaperPositionsTable {
   // magnitude, same sign convention as paper_fills.fee — not pre-negated.
   slippage_cost: string | null; // numeric
   borrow_cost: string | null; // numeric
+  // migrations/1786055157851_add-paper-positions-exit-reasoning.sql: symmetric
+  // to entry_reasoning above — rationale for the CLOSE decision (reasonCode,
+  // funding/basis at exit, hold duration, forced-liquidation price if
+  // applicable — see scenarioRunner.ts closePosition), not a fact. Null until
+  // the position closes, same reasoning as slippage_cost/borrow_cost above.
+  exit_reasoning: string | null; // FR-202
 }
 
 export interface PaperFillsTable {
