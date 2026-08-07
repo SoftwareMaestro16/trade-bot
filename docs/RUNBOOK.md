@@ -144,21 +144,25 @@ sudo systemctl enable --now trade-bot-collector
 **По факту (2026-08-07): `/opt/trade-bot` на VPS — не git-чекаут** (`.git` там нет). Код доставляется tar-синком с локальной машины, обычно по SSH под `root`:
 
 ```bash
-# с локальной машины
-tar czf - --exclude=node_modules --exclude=.git --exclude=dist . | \
+# с локальной машины — .env НИКОГДА не синкать, продовый .env живёт только на VPS
+tar czf - --exclude=node_modules --exclude=.git --exclude=dist --exclude=.env --exclude='.env.*' . | \
   ssh -i .deploy-keys/trade_bot_vps root@<VPS_IP> "tar xzf - -C /opt/trade-bot"
 
-# на VPS
+# на VPS — chown ПЕРЕД npm ci/build, рекурсивно, не только верхний каталог
+chown -R tradebot:tradebot /opt/trade-bot
 cd /opt/trade-bot
-npm ci
-npm run build
+sudo -u tradebot npm ci
+sudo -u tradebot npm run build
 npm run migrate:up                # если есть новые миграции — см. раздел 5
-chown tradebot:tradebot /opt/trade-bot   # ОБЯЗАТЕЛЬНО, см. ниже
 sudo systemctl restart trade-bot-collector
 sudo systemctl restart trade-bot-killswitch-listener
 ```
 
-**Почему `chown` обязателен, не опционален**: `tar` на Windows/Git-Bash не имеет реального UID/GID-маппинга, поэтому `root`, распаковывая архив, создаёт верхнеуровневый каталог `/opt/trade-bot` с сырыми числовыми владельцами локальной машины — НЕ `tradebot`, от чьего имени реально работают оба systemd-юнита (`User=tradebot`). `dist/`/`node_modules/` при этом получаются верно (`npm ci`/`npm run build` выполняются уже от `tradebot` или пересоздают эти каталоги), но сам верхний каталог — нет. Это не гипотетический риск: инцидент 2026-08-07 (см. PHASE-LOG.md) — `killswitch-listener`'s собственный стартовый self-test (`killswitch/fileFlag.ts`) не смог создать `KILLSWITCH_STOP` в `/opt/trade-bot` из-за `EACCES`, корректно отказался стартовать (fail-closed), и после исчерпания `StartLimitBurst=5` кильсвич уровня 1 пролежал недоступным **4 часа 43 минуты**, пока не был обнаружен вручную. `trade-bot-collector` не пострадал только потому, что не пишет новых файлов в верхний уровень каталога — это везение, не гарантия.
+**Почему `chown -R` обязателен, не опционален, и почему именно в таком порядке**: `tar` на Windows/Git-Bash не имеет реального UID/GID-маппинга, поэтому `root`, распаковывая архив, создаёт всё дерево `/opt/trade-bot` с сырыми числовыми владельцами локальной машины — НЕ `tradebot`, от чьего имени реально работают оба systemd-юнита (`User=tradebot`). Два реальных инцидента 2026-08-07 (см. PHASE-LOG.md), не гипотетических:
+1. Верхнеуровневый каталог достался чужому UID → `killswitch-listener`'s стартовый self-test (`killswitch/fileFlag.ts`) не смог создать `KILLSWITCH_STOP` (`EACCES`), корректно отказался стартовать (fail-closed), `StartLimitBurst=5` исчерпался — кильсвич уровня 1 пролежал недоступным **4 часа 43 минуты**.
+2. Тем же днём, позже: `npm ci` от имени `tradebot` упал с `EACCES` на `rmdir` внутри `node_modules/.vite` — след более раннего запуска `npm ci`/`npm run build` от `root` без `sudo -u tradebot`, оставившего часть `node_modules` рут-владением.
+
+Вывод: одного `chown` верхнего каталога после сборки недостаточно — нужен `chown -R` ДО любых `npm`-команд, И сами `npm ci`/`npm run build` должны запускаться явно от `tradebot` (`sudo -u tradebot`), а не «как получится», иначе следующий деплой снова испортит владение поддеревом `node_modules`/`dist`. `trade-bot-collector` не пострадал от инцидента №1 только потому, что не пишет новых файлов в верхний уровень каталога — это везение, не гарантия.
 
 Если/когда появится приватный git remote, план — переключиться на `git clone`/`git pull` (см. ниже), что снимает эту проблему полностью: `git pull`, выполненный от `tradebot`, никогда не тронет владельца каталога. До этого момента `chown` — обязательный последний шаг любого tar-синк-деплоя, не «на будущее».
 
