@@ -1,6 +1,8 @@
 import type { Kysely } from "kysely";
 import type { HaltState } from "../killswitch/haltState.js";
 import type { Database } from "../storage/schema.js";
+import { checkDiskUsage } from "./diskUsage.js";
+import type { DiskUsage } from "./diskUsage.js";
 
 /**
  * Owner's own worry, verbatim: "одним сообщением выдает что работает что не
@@ -64,7 +66,12 @@ export interface StatusReport {
   collectionRunsRecentFailed: number;
   lastCollectionRunAt: Date | null;
   overallHealthy: boolean;
+  /** null when unavailable (e.g. this codebase's own Windows dev environment) — see diskUsage.ts's own doc comment for why that's never fatal to the rest of this report. */
+  diskUsage: DiskUsage | null;
 }
+
+/** 2026-08-07: interim visibility until migrations/1786109550746_orderbook-levels-compression.sql's chunk closes 2026-08-13 — see diskUsage.ts. Does NOT affect overallHealthy: a full disk is a real problem, but it isn't the SAME "is data still flowing" question overallHealthy answers, and conflating them would make overallHealthy flip on disk pressure that hasn't actually stopped anything yet. */
+const DISK_USAGE_WARN_FRACTION = 0.8;
 
 /**
  * Pure overall verdict, split out from `computeStatusReport` for the same
@@ -189,6 +196,7 @@ export async function computeStatusReport(db: Kysely<Database>, haltState: HaltS
     collectionRunsRecentFailed,
     lastCollectionRunAt,
     overallHealthy,
+    diskUsage: checkDiskUsage(),
   };
 }
 
@@ -203,6 +211,19 @@ function formatAge(ageMs: number | null): string {
 
 function formatDateTime(date: Date): string {
   return date.toISOString().replace("T", " ").slice(0, 16) + " UTC";
+}
+
+function formatBytes(bytes: number): string {
+  const gb = bytes / 1024 ** 3;
+  return `${gb.toFixed(1)} GB`;
+}
+
+/** null (checkDiskUsage couldn't stat the path — e.g. a dev machine) renders as an explicit "н/д", never silently omitted, so a broken check is visible, not indistinguishable from "nothing to report." */
+function formatDiskUsageLine(diskUsage: DiskUsage | null): string {
+  if (!diskUsage) return "Диск: н/д";
+  const usedPct = Math.round(diskUsage.usedFraction * 100);
+  const mark = diskUsage.usedFraction >= DISK_USAGE_WARN_FRACTION ? "⚠️" : "✅";
+  return `${mark} Диск: ${String(usedPct)}% занято, свободно ${formatBytes(diskUsage.availableBytes)} из ${formatBytes(diskUsage.totalBytes)}`;
 }
 
 /** Mirrors notify/formatDigest.ts's HTML-escaping choice and reasoning — see that file. */
@@ -248,6 +269,8 @@ export function formatStatusReport(report: StatusReport): string {
       ? `Последний цикл: ${formatDateTime(report.lastCollectionRunAt)}`
       : "Последний цикл: ни одного не найдено вообще",
   );
+  lines.push("");
+  lines.push(formatDiskUsageLine(report.diskUsage));
 
   return lines.join("\n");
 }
@@ -298,6 +321,8 @@ export function formatStatusReportTable(report: StatusReport): string {
   blocks.push(
     `**Циклы сбора** (последние 15 мин): ✅ ${String(report.collectionRunsRecentCompleted)}  ❌ ${String(report.collectionRunsRecentFailed)}  ·  ${lastRunText}`,
   );
+
+  blocks.push(formatDiskUsageLine(report.diskUsage));
 
   return blocks.join("\n\n");
 }

@@ -11,6 +11,7 @@ import type { StatusReport, TableFreshness } from "../../src/notify/statusReport
 import { createDb } from "../../src/storage/db.js";
 import type { Database } from "../../src/storage/schema.js";
 import type { HaltState } from "../../src/killswitch/haltState.js";
+import type { DiskUsage } from "../../src/notify/diskUsage.js";
 
 const SYM = "__TEST_STATUSREPORT__USDT";
 const NOW = new Date("2026-08-06T12:00:00Z");
@@ -99,6 +100,7 @@ describe("formatStatusReport", () => {
     collectionRunsRecentFailed: 1,
     lastCollectionRunAt: NOW,
     overallHealthy: false,
+    diskUsage: null,
   };
 
   it("renders a ✅ header when healthy, ⚠️ when not", () => {
@@ -131,6 +133,33 @@ describe("formatStatusReport", () => {
     expect(text).toContain("HALT_NEW: 🛑 on");
     expect(text).toContain("FLATTEN_ALL: 🛑 on");
   });
+
+  it("renders disk usage as н/д (explicit, not silently omitted) when diskUsage is null", () => {
+    const text = formatStatusReport({ ...baseReport, diskUsage: null });
+    expect(text).toContain("Диск: н/д");
+  });
+
+  it("renders disk usage with ✅ below the warning threshold", () => {
+    const diskUsage: DiskUsage = {
+      path: "/",
+      totalBytes: 100 * 1024 ** 3,
+      availableBytes: 50 * 1024 ** 3,
+      usedFraction: 0.5,
+    };
+    const text = formatStatusReport({ ...baseReport, diskUsage });
+    expect(text).toContain("✅ Диск: 50% занято, свободно 50.0 GB из 100.0 GB");
+  });
+
+  it("renders disk usage with ⚠️ at/above the warning threshold (80%)", () => {
+    const diskUsage: DiskUsage = {
+      path: "/",
+      totalBytes: 100 * 1024 ** 3,
+      availableBytes: 20 * 1024 ** 3,
+      usedFraction: 0.8,
+    };
+    const text = formatStatusReport({ ...baseReport, diskUsage });
+    expect(text).toContain("⚠️ Диск: 80% занято");
+  });
 });
 
 describe("formatStatusReportTable (Bot API 10.1 sendRichMessage markdown)", () => {
@@ -147,6 +176,7 @@ describe("formatStatusReportTable (Bot API 10.1 sendRichMessage markdown)", () =
     collectionRunsRecentFailed: 1,
     lastCollectionRunAt: NOW,
     overallHealthy: false,
+    diskUsage: null,
   };
 
   it("produces a GFM-style pipe table with one row per gated table plus a liquidations row", () => {
@@ -191,6 +221,18 @@ describe("formatStatusReportTable (Bot API 10.1 sendRichMessage markdown)", () =
     const table = formatStatusReportTable(baseReport);
     const tableBlockStart = table.indexOf("| Таблица");
     expect(table.slice(tableBlockStart - 2, tableBlockStart)).toBe("\n\n");
+  });
+
+  it("renders disk usage as its own block, н/д when diskUsage is null", () => {
+    const table = formatStatusReportTable({ ...baseReport, diskUsage: null });
+    expect(table).toContain("Диск: н/д");
+  });
+
+  it("renders disk usage with ✅/⚠️ matching the same 80% threshold as formatStatusReport", () => {
+    const healthy: DiskUsage = { path: "/", totalBytes: 100 * 1024 ** 3, availableBytes: 50 * 1024 ** 3, usedFraction: 0.5 };
+    const full: DiskUsage = { path: "/", totalBytes: 100 * 1024 ** 3, availableBytes: 10 * 1024 ** 3, usedFraction: 0.9 };
+    expect(formatStatusReportTable({ ...baseReport, diskUsage: healthy })).toContain("✅ Диск: 50%");
+    expect(formatStatusReportTable({ ...baseReport, diskUsage: full })).toContain("⚠️ Диск: 90%");
   });
 });
 
