@@ -10,7 +10,7 @@ import { createPersistQueue } from "./killswitch/persistQueue.js";
 import { createInFlightTracker } from "./killswitch/inFlightPersists.js";
 import type { HaltStateDatabase } from "./killswitch/haltStatePersistence.js";
 import { isAuthorizedChat, manageAuthorizedUserCommand } from "./killswitch/authorizedUsers.js";
-import { routeAuthorizedCommand } from "./killswitch/commandRouter.js";
+import { COMMAND_DOCS, routeAuthorizedCommand } from "./killswitch/commandRouter.js";
 import type { CommandRouterDeps } from "./killswitch/commandRouter.js";
 import { logger as rootLogger } from "./logger.js";
 import { sendAlert, sendRichMessage } from "./notify/telegram.js";
@@ -19,6 +19,7 @@ import { deliverPending, enqueueNotification } from "./notify/notificationQueue.
 import { startCommandPolling } from "./notify/telegramPolling.js";
 import type { TelegramPollingHandle } from "./notify/telegramPolling.js";
 import { computeStatusReport, formatStatusReportTable } from "./notify/statusReport.js";
+import { formatHelpTable } from "./notify/helpText.js";
 import { scheduleRepeating } from "./scheduleRepeating.js";
 import type { ScheduledTask } from "./scheduleRepeating.js";
 import type { Database } from "./storage/schema.js";
@@ -234,6 +235,22 @@ async function main(): Promise<void> {
   }
 
   /**
+   * Owner's own request: "/help красиво с маркдаун форматированием в таблице
+   * выведет все команды как использовать и для чего" — same sendRichMessage/
+   * Bot API 10.1 table mechanism as sendStatusReport above, no DB read
+   * needed (COMMAND_DOCS is a static list next to routeAuthorizedCommand's
+   * own switch, see commandRouter.ts's own doc comment).
+   */
+  async function sendHelp(): Promise<void> {
+    if (!telegramConfig) return;
+    try {
+      await sendRichMessage(telegramConfig, formatHelpTable(COMMAND_DOCS));
+    } catch (e) {
+      logger.error({ err: e }, "failed to build/send /help reply");
+    }
+  }
+
+  /**
    * Thin logging wrapper around killswitch/authorizedUsers.ts's
    * manageAuthorizedUserCommand, which owns the actual root-admin gate +
    * candidate validation + DB mutation (and is unit-tested directly there,
@@ -294,6 +311,7 @@ async function main(): Promise<void> {
     inFlightPersists,
     applyAndPersist,
     sendStatusReport,
+    sendHelp,
     manageAuthorizedUser,
     telegramConfig,
     logger,

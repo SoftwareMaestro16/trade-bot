@@ -28,6 +28,7 @@ export interface CommandRouterDeps {
   inFlightPersists: InFlightTracker;
   applyAndPersist: (next: HaltState, logLine: string) => Promise<void>;
   sendStatusReport: () => Promise<void>;
+  sendHelp: () => Promise<void>;
   manageAuthorizedUser: (
     command: "add" | "delete",
     candidate: string | undefined,
@@ -38,6 +39,41 @@ export interface CommandRouterDeps {
   logger: Logger;
 }
 
+/**
+ * Owner's own request: "/help красиво с маркдаун форматированием в таблице
+ * выведет все команды как использовать и для чего" — a single source of
+ * truth for what each command does, kept in this file specifically (not
+ * notify/) so it sits next to the switch statement below it documents and
+ * can't quietly drift out of sync with it unnoticed. notify/helpText.ts's
+ * formatHelpTable renders this array as a Bot API 10.1 markdown table (see
+ * that file for why a real table, not monospace `<code>` alignment).
+ */
+export interface CommandDoc {
+  usage: string;
+  description: string;
+}
+
+export const COMMAND_DOCS: readonly CommandDoc[] = [
+  { usage: "/stop", description: "HALT_NEW — блокирует новые входы в позиции. Существующие позиции не трогает." },
+  {
+    usage: "/flatten",
+    description:
+      "FLATTEN_ALL — блокирует новые входы и закрывает всё существующее " +
+      "(сегодня только выставляет флаг: реального закрытия позиций ещё нет, execution/ order placement не подключён).",
+  },
+  {
+    usage: "/resume [причина]",
+    description: "Снимает halt (оба флага). Причина — свободный текст, попадает в лог как подтверждение.",
+  },
+  {
+    usage: "/status",
+    description: "Отчёт одним сообщением: kill switch, свежесть данных по таблицам, статистика последних циклов сбора.",
+  },
+  { usage: "/add <chat_id>", description: "Добавляет chat_id в список авторизованных отправителей команд. Только root admin." },
+  { usage: "/delete <chat_id>", description: "Убирает chat_id из списка авторизованных. Только root admin." },
+  { usage: "/help", description: "Этот список." },
+];
+
 // RR-33 (extended): only a chat_id that's either the root admin or already
 // in the authorized_users table ever reaches this function at all —
 // isAuthorizedChat/authorizeCommand have already filtered by the time
@@ -46,8 +82,16 @@ export interface CommandRouterDeps {
 // commands are further restricted to ONLY the root admin, not every
 // authorized chat_id — see the "add"/"delete" case below.
 export function routeAuthorizedCommand(command: string, args: string[], chatId: string, deps: CommandRouterDeps): void {
-  const { getState, inFlightPersists, applyAndPersist, sendStatusReport, manageAuthorizedUser, telegramConfig, logger } =
-    deps;
+  const {
+    getState,
+    inFlightPersists,
+    applyAndPersist,
+    sendStatusReport,
+    sendHelp,
+    manageAuthorizedUser,
+    telegramConfig,
+    logger,
+  } = deps;
 
   switch (command) {
     case "stop":
@@ -82,6 +126,10 @@ export function routeAuthorizedCommand(command: string, args: string[], chatId: 
 
     case "status":
       void sendStatusReport();
+      break;
+
+    case "help":
+      void sendHelp();
       break;
 
     // Owner's own requirement: /add and /delete manage WHO can issue any
