@@ -2,7 +2,7 @@ import nock from "nock";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { startCommandPolling } from "../../src/notify/telegramPolling.js";
 import type { TelegramPollingHandle } from "../../src/notify/telegramPolling.js";
-import type { TelegramConfig } from "../../src/notify/telegram.js";
+import type { ChatAuthorizer, TelegramConfig } from "../../src/notify/telegram.js";
 
 const TELEGRAM_BASE = "https://api.telegram.org";
 // Deliberately eye-catching, same convention as test/notify/telegram.test.ts,
@@ -14,6 +14,14 @@ const config: TelegramConfig = {
   botToken: FAKE_TOKEN,
   allowedChatId: "555000111",
 };
+
+// Stand-in ChatAuthorizer mirroring the pre-refactor single-chat_id
+// whitelist — this file tests startCommandPolling's own plumbing (offset
+// tracking, error backoff, stop() semantics, awaiting authorizeCommand
+// before calling onCommand), not authorization policy itself (that's
+// test/notify/telegram.test.ts's authorizeCommand suite and
+// test/killswitch/authorizedUsers.test.ts's DB-backed suite).
+const isAuthorizedChat: ChatAuthorizer = (chatId) => Promise.resolve(chatId === config.allowedChatId);
 
 function updatesReply(result: unknown[]): { ok: true; result: unknown[] } {
   return { ok: true, result };
@@ -63,16 +71,22 @@ describe("startCommandPolling", () => {
     mockQuietTail();
 
     const onCommand = vi.fn();
-    const handle = startCommandPolling(config, onCommand);
+    const handle = startCommandPolling(config, isAuthorizedChat, onCommand);
 
     await vi.waitFor(() => {
       expect(onCommand).toHaveBeenCalledTimes(2);
     });
 
     expect(scope.isDone()).toBe(true);
-    expect(onCommand).toHaveBeenNthCalledWith(1, { authorized: true, command: "status", args: [] });
+    expect(onCommand).toHaveBeenNthCalledWith(1, {
+      authorized: true,
+      chatId: "555000111",
+      command: "status",
+      args: [],
+    });
     expect(onCommand).toHaveBeenNthCalledWith(2, {
       authorized: true,
+      chatId: "555000111",
       command: "stop",
       args: ["now", "please"],
     });
@@ -94,14 +108,19 @@ describe("startCommandPolling", () => {
     mockQuietTail();
 
     const onCommand = vi.fn();
-    const handle = startCommandPolling(config, onCommand);
+    const handle = startCommandPolling(config, isAuthorizedChat, onCommand);
 
     await vi.waitFor(() => {
       expect(onCommand).toHaveBeenCalledTimes(2);
     });
 
     expect(scope.isDone()).toBe(true);
-    expect(onCommand).toHaveBeenNthCalledWith(1, { authorized: true, command: "status", args: [] });
+    expect(onCommand).toHaveBeenNthCalledWith(1, {
+      authorized: true,
+      chatId: "555000111",
+      command: "status",
+      args: [],
+    });
     expect(onCommand).toHaveBeenNthCalledWith(2, { authorized: false, rejectedChatId: "999999999" });
 
     void handle.stop();
@@ -124,7 +143,7 @@ describe("startCommandPolling", () => {
     mockQuietTail();
 
     const onCommand = vi.fn();
-    const handle = startCommandPolling(config, onCommand);
+    const handle = startCommandPolling(config, isAuthorizedChat, onCommand);
 
     await vi.waitFor(() => {
       expect(scope2.isDone()).toBe(true);
@@ -153,7 +172,7 @@ describe("startCommandPolling", () => {
       .reply(200, updatesReply([]));
     mockQuietTail();
 
-    const handle = startCommandPolling(config, vi.fn());
+    const handle = startCommandPolling(config, isAuthorizedChat, vi.fn());
 
     await vi.waitFor(() => {
       expect(scope2.isDone()).toBe(true); // proves the second call queried offset=12 exactly
@@ -173,7 +192,7 @@ describe("startCommandPolling", () => {
     mockQuietTail();
 
     const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const handle = startCommandPolling(config, vi.fn(), { errorBackoffMs: 150 });
+    const handle = startCommandPolling(config, isAuthorizedChat, vi.fn(), { errorBackoffMs: 150 });
 
     await vi.waitFor(() => {
       expect(scope1.isDone()).toBe(true);
@@ -226,7 +245,7 @@ describe("startCommandPolling", () => {
         return [200, updatesReply([])];
       });
 
-    handleRef.current = startCommandPolling(config, vi.fn());
+    handleRef.current = startCommandPolling(config, isAuthorizedChat, vi.fn());
 
     await vi.waitFor(() => {
       expect(scope1.isDone()).toBe(true);

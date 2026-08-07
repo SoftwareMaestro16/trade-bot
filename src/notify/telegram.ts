@@ -235,26 +235,45 @@ export interface IncomingCommand {
 }
 
 export type AuthorizedCommand =
-  | { authorized: true; command: string; args: string[] }
+  | { authorized: true; chatId: string; command: string; args: string[] }
   | { authorized: false; rejectedChatId: string };
 
 /**
+ * Answers "is this chat_id allowed to issue kill-switch commands at all?".
+ * Injected by the caller rather than this module reaching for a single
+ * hardcoded chat_id itself — this module has no notion of "root admin" or
+ * "additional authorized users via a DB table"; that policy lives entirely
+ * with whoever constructs the predicate (killswitch-listener.ts's
+ * isAuthorizedChat). `chatId` is always the raw string off the wire — see
+ * authorizeCommand's own doc comment for why comparisons must never coerce
+ * through Number().
+ */
+export type ChatAuthorizer = (chatId: string) => Promise<boolean>;
+
+/**
  * RR-33 (SRS.md, verbatim): "Команды Telegram принимаются только от одного
- * chat_id из белого списка. Все прочие отвергаются и логируются." This
- * function is the compare-and-parse half of that requirement, kept pure (no
- * logging, no I/O) like the rest of this module's parsing logic. `chatId` is
- * compared as a plain string, never coerced through Number(): group chat_ids
- * are negative, and string equality is the only comparison that can't be
- * fooled by numeric-format quirks (e.g. "007" vs "7" are equal numerically
- * but must NOT be treated as the same chat).
+ * chat_id из белого списка. Все прочие отвергаются и логируются." Originally
+ * that whitelist was a single hardcoded chat_id compared directly against
+ * `TelegramConfig.allowedChatId`; it has since grown to "root admin + a DB
+ * table of additionally authorized chat_ids" (killswitch-listener.ts), so
+ * this function no longer owns that comparison itself — it delegates to the
+ * injected `isAuthorized` predicate and stays pure otherwise (no logging, no
+ * I/O of its own beyond awaiting the predicate it was handed). `chatId` is
+ * passed to the predicate as a plain string, never coerced through Number():
+ * group chat_ids are negative, and string equality is the only comparison
+ * that can't be fooled by numeric-format quirks (e.g. "007" vs "7" are equal
+ * numerically but must NOT be treated as the same chat).
  *
  * RR-33's other half — that rejected attempts are logged — is NOT done here.
  * The caller MUST log every `{ authorized: false, rejectedChatId }` result
  * this function returns; skipping that silently breaks RR-33 even though the
  * rejection itself still works correctly.
  */
-export function authorizeCommand(config: TelegramConfig, incoming: IncomingCommand): AuthorizedCommand {
-  if (incoming.chatId !== config.allowedChatId) {
+export async function authorizeCommand(
+  isAuthorized: ChatAuthorizer,
+  incoming: IncomingCommand,
+): Promise<AuthorizedCommand> {
+  if (!(await isAuthorized(incoming.chatId))) {
     return { authorized: false, rejectedChatId: incoming.chatId };
   }
 
@@ -262,5 +281,5 @@ export function authorizeCommand(config: TelegramConfig, incoming: IncomingComma
   const withoutSlash = trimmed.startsWith("/") ? trimmed.slice(1) : trimmed;
   const parts = withoutSlash.split(/\s+/).filter((part) => part.length > 0);
 
-  return { authorized: true, command: parts[0] ?? "", args: parts.slice(1) };
+  return { authorized: true, chatId: incoming.chatId, command: parts[0] ?? "", args: parts.slice(1) };
 }

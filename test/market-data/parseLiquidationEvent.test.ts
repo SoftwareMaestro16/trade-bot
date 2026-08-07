@@ -65,4 +65,68 @@ describe("parseLiquidationEvent", () => {
     const event = { topic: "allLiquidation.BTCUSDT", type: "snapshot", ts: 1, data: [] };
     expect(parseLiquidationEvent(event)).toEqual([]);
   });
+
+  // isWsAllLiquidationEvent (bybit-api) only checks that `topic` starts with
+  // "allLiquidation" and that `topic`/`type` are strings — it never inspects
+  // `data`. So a malformed real-world payload with a matching topic but a
+  // missing/null/non-array `data` field passes the type guard and must be
+  // handled by the `!Array.isArray(data)` check on its own.
+  it("returns an empty array when data is missing entirely", () => {
+    const event = { topic: "allLiquidation.BTCUSDT", type: "snapshot", ts: 1 };
+    expect(parseLiquidationEvent(event)).toEqual([]);
+  });
+
+  it("returns an empty array when data is null", () => {
+    const event = { topic: "allLiquidation.BTCUSDT", type: "snapshot", ts: 1, data: null };
+    expect(parseLiquidationEvent(event)).toEqual([]);
+  });
+
+  it("returns an empty array when data is an object rather than an array", () => {
+    const event = {
+      topic: "allLiquidation.BTCUSDT",
+      type: "snapshot",
+      ts: 1,
+      data: { T: 1, s: "BTCUSDT", S: "Sell", v: "1", p: "1" },
+    };
+    expect(parseLiquidationEvent(event)).toEqual([]);
+  });
+
+  it("skips an item with a wrong-typed or missing symbol (s)", () => {
+    const event = {
+      topic: "allLiquidation.BTCUSDT",
+      type: "snapshot",
+      ts: 1,
+      data: [
+        { T: 1, s: 123, S: "Sell", v: "1", p: "1" }, // s wrong type
+        { T: 2, S: "Sell", v: "1", p: "1" }, // s missing
+      ],
+    };
+    expect(parseLiquidationEvent(event)).toEqual([]);
+  });
+
+  it("skips an item with a wrong-typed or missing size (v)", () => {
+    const event = {
+      topic: "allLiquidation.BTCUSDT",
+      type: "snapshot",
+      ts: 1,
+      data: [
+        { T: 1, s: "BTCUSDT", S: "Sell", v: 1, p: "1" }, // v wrong type
+        { T: 2, s: "BTCUSDT", S: "Sell", p: "1" }, // v missing
+      ],
+    };
+    expect(parseLiquidationEvent(event)).toEqual([]);
+  });
+
+  it("skips an item with a wrong-typed or missing price (p)", () => {
+    const event = {
+      topic: "allLiquidation.BTCUSDT",
+      type: "snapshot",
+      ts: 1,
+      data: [
+        { T: 1, s: "BTCUSDT", S: "Sell", v: "1", p: 1 }, // p wrong type
+        { T: 2, s: "BTCUSDT", S: "Sell", v: "1" }, // p missing
+      ],
+    };
+    expect(parseLiquidationEvent(event)).toEqual([]);
+  });
 });

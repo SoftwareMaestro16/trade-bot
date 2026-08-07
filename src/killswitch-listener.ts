@@ -8,6 +8,7 @@ import { selfTestFileFlag, startFileFlagWatcher } from "./killswitch/fileFlag.js
 import { loadHaltState, saveHaltState } from "./killswitch/haltStatePersistence.js";
 import { createPersistQueue } from "./killswitch/persistQueue.js";
 import type { HaltStateDatabase } from "./killswitch/haltStatePersistence.js";
+import { isAuthorizedChat, manageAuthorizedUserCommand } from "./killswitch/authorizedUsers.js";
 import { logger as rootLogger } from "./logger.js";
 import { sendAlert, sendRichMessage } from "./notify/telegram.js";
 import type { TelegramConfig } from "./notify/telegram.js";
@@ -179,10 +180,59 @@ async function main(): Promise<void> {
     }
   }
 
-  // RR-33: only a chat_id already in the whitelist ever reaches this
-  // function at all — authorizeCommand() has already filtered by the time
-  // startCommandPolling calls onCommand.
-  function handleAuthorizedCommand(command: string, args: string[]): void {
+  /**
+   * Thin logging wrapper around killswitch/authorizedUsers.ts's
+   * manageAuthorizedUserCommand, which owns the actual root-admin gate +
+   * candidate validation + DB mutation (and is unit-tested directly there,
+   * against a real Postgres, independent of this whole process). This
+   * function's only job is turning that function's outcome into a log line —
+   * same division of labor as applyAndPersist (state transition happens in
+   * haltState.ts, this file only persists + logs + alerts).
+   */
+  async function manageAuthorizedUser(
+    command: "add" | "delete",
+    candidate: string | undefined,
+    senderChatId: string,
+    rootAdminChatId: string,
+  ): Promise<void> {
+    const result = await manageAuthorizedUserCommand(statusDb, { command, senderChatId, rootAdminChatId, candidate });
+    switch (result.outcome) {
+      case "rejected_not_root_admin":
+        // Should be unreachable in practice — handleAuthorizedCommand's own
+        // "add"/"delete" case already checked this before calling here — but
+        // logged loudly (not silently ignored) in case that invariant is
+        // ever broken by a future edit to this file.
+        logger.error({ command, senderChatId }, `/${command}: REJECTED — sender is not the root admin`);
+        break;
+      case "rejected_invalid_candidate":
+        logger.error(
+          { command, candidate: result.candidate },
+          `/${command}: invalid/suspicious chat_id argument — not ${command === "add" ? "added" : "deleted"}`,
+        );
+        break;
+      case "added":
+        logger.info({ chatId: result.chatId, addedBy: rootAdminChatId }, "/add: chat_id authorized (idempotent)");
+        break;
+      case "removed":
+        logger.info(
+          { chatId: result.chatId, wasPresent: result.wasPresent },
+          "/delete: chat_id removed (idempotent — wasPresent:false means it wasn't there)",
+        );
+        break;
+      case "db_error":
+        logger.error({ err: result.error, command, candidate }, `/${command} failed against authorized_users`);
+        break;
+    }
+  }
+
+  // RR-33 (extended): only a chat_id that's either the root admin or already
+  // in the authorized_users table ever reaches this function at all —
+  // isAuthorizedChat/authorizeCommand have already filtered by the time
+  // startCommandPolling calls onCommand. `chatId` is that already-authorized
+  // sender, needed here specifically for /add and /delete: those two
+  // commands are further restricted to ONLY the root admin, not every
+  // authorized chat_id — see the "add"/"delete" case below.
+  function handleAuthorizedCommand(command: string, args: string[], chatId: string): void {
     switch (command) {
       case "stop":
         void applyAndPersist(
@@ -214,6 +264,37 @@ async function main(): Promise<void> {
         void sendStatusReport();
         break;
 
+      // Owner's own requirement: /add and /delete manage WHO can issue any
+      // of the commands above, so they must be restricted to the root admin
+      // ONLY — a chat_id merely present in authorized_users (and therefore
+      // already able to reach this function per the comment above) must NOT
+      // be able to authorize further chat_ids or de-authorize others. No
+      // reply is sent to the rejecting chat_id: there is no general
+      // "reply to an arbitrary chat_id" mechanism in this codebase (outbound
+      // sendAlert/sendRichMessage/sendDocument all target config.allowedChatId
+      // only, deliberately untouched by this change), so this is
+      // logged-and-silently-dropped, same as an RR-33 rejection.
+      case "add":
+      case "delete":
+        if (!telegramConfig) {
+          logger.error({ chatId, command, args }, `REJECTED /${command} — Telegram is not configured`);
+          break;
+        }
+        // The root-admin-only gate is also enforced inside
+        // manageAuthorizedUserCommand itself (manageAuthorizedUser above logs
+        // its "rejected_not_root_admin" outcome loudly if that ever
+        // triggers) — checked here too so a non-root sender's attempt is
+        // logged immediately, without an extra DB round trip.
+        if (chatId !== telegramConfig.allowedChatId) {
+          logger.error(
+            { chatId, command, args },
+            `REJECTED /${command} — only the root admin chat_id may manage authorized_users`,
+          );
+          break;
+        }
+        void manageAuthorizedUser(command, args[0], chatId, telegramConfig.allowedChatId);
+        break;
+
       default:
         logger.info({ command }, "unrecognized command");
     }
@@ -221,14 +302,24 @@ async function main(): Promise<void> {
 
   let telegramPolling: TelegramPollingHandle | null = null;
   if (telegramConfig) {
-    telegramPolling = startCommandPolling(telegramConfig, (result) => {
-      if (!result.authorized) {
-        // RR-33: every rejection is logged, no exceptions — this IS that logging.
-        logger.error({ rejectedChatId: result.rejectedChatId }, "REJECTED command from unauthorized chat_id");
-        return;
-      }
-      handleAuthorizedCommand(result.command, result.args);
-    });
+    // Captured as its own const (rather than reading telegramConfig.allowedChatId
+    // inside the arrow function below) purely so the ChatAuthorizer closure is
+    // unambiguously a plain string, not TelegramConfig | null — telegramConfig
+    // itself stays non-null for this whole `if` block, but this keeps the
+    // isAuthorizedChat call site trivial to read either way.
+    const rootAdminChatId = telegramConfig.allowedChatId;
+    telegramPolling = startCommandPolling(
+      telegramConfig,
+      (chatId) => isAuthorizedChat(statusDb, rootAdminChatId, chatId),
+      (result) => {
+        if (!result.authorized) {
+          // RR-33: every rejection is logged, no exceptions — this IS that logging.
+          logger.error({ rejectedChatId: result.rejectedChatId }, "REJECTED command from unauthorized chat_id");
+          return;
+        }
+        handleAuthorizedCommand(result.command, result.args, result.chatId);
+      },
+    );
     logger.info("Telegram command polling started");
   } else {
     // RR-32 requires two independent Level-1 paths; without Telegram

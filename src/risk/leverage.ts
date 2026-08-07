@@ -22,6 +22,21 @@ export function checkLeverage(shortNotional: Big, totalEquity: Big): VetoResult 
     throw new RangeError(`totalEquity must be positive, got ${totalEquity.toString()}`);
   }
 
+  // A real short leg notional cannot be negative — that implies an upstream
+  // sign/subtraction bug, not a legitimate position. Left unguarded, the
+  // one-sided `.gt(LEVERAGE_MAX)` check below never fires for a negative
+  // ratio (it's always far under the ceiling), so this would silently sail
+  // through allow() on exactly the input a veto exists to catch. Denied
+  // (not thrown) for the same reason checkFundingBlackout's NaN guard denies
+  // rather than throws: this is an implausible-but-reachable input from a
+  // caller bug, not the "account is dead" state totalEquity<=0 represents.
+  if (shortNotional.lt(0)) {
+    return deny(
+      "LEVERAGE_NOTIONAL_IMPLAUSIBLE",
+      `shortNotional ${shortNotional.toString()} is negative — not a legitimate short leg notional, failing closed instead of passing the one-sided ${LEVERAGE_MAX.toString()}x ceiling check (RR-20).`,
+    );
+  }
+
   const effectiveLeverage = shortNotional.div(totalEquity);
   if (effectiveLeverage.gt(LEVERAGE_MAX)) {
     return deny(
@@ -61,8 +76,31 @@ export function checkAccountMMRate(projectedAccountMMRate: Big): VetoResult {
  * in a single coin, measured by the SPOT leg's notional — equal to the short leg's
  * notional in a delta-neutral pair, which is why the spot leg is the value taken
  * here rather than the short leg directly.
+ *
+ * Same `totalEquity <= 0` guard as checkLeverage above, and for the same reason:
+ * that state cannot happen under correct business logic, so it throws a
+ * documented RangeError instead of being modeled as a veto outcome. Without
+ * this guard, checkConcentration is called directly by callers other than
+ * checkEntry (see TEST-CASES.md #63 in test/risk/index.test.ts), so
+ * checkEntry's fixed check order — where checkLeverage runs first and would
+ * already have thrown — does not protect every caller.
  */
 export function checkConcentration(spotLegNotional: Big, totalEquity: Big): VetoResult {
+  if (totalEquity.lte(0)) {
+    throw new RangeError(`totalEquity must be positive, got ${totalEquity.toString()}`);
+  }
+
+  // Same rationale as checkLeverage's shortNotional guard above: a real spot
+  // leg notional cannot be negative, and the one-sided `.gt(CONCENTRATION_MAX)`
+  // check below never fires for a negative ratio, so this fails closed instead
+  // of silently allowing.
+  if (spotLegNotional.lt(0)) {
+    return deny(
+      "CONCENTRATION_NOTIONAL_IMPLAUSIBLE",
+      `spotLegNotional ${spotLegNotional.toString()} is negative — not a legitimate spot leg notional, failing closed instead of passing the one-sided ${CONCENTRATION_MAX.toString()} cap check (RR-21).`,
+    );
+  }
+
   const concentration = spotLegNotional.div(totalEquity);
   if (concentration.gt(CONCENTRATION_MAX)) {
     return deny(

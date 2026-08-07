@@ -119,6 +119,58 @@ describe("computeDigestStats", () => {
     expect(stats.recentFailures.some((f) => f.error === "__TEST_DIGEST_FAILURE__ timeout")).toBe(true);
   });
 
+  it("returns only the 5 most recent failures, newest first, when more than 5 occurred in-window (ORDER BY started_at DESC LIMIT 5)", async () => {
+    // Deliberately its own window (year 2030) that none of this file's other
+    // fixtures ever touch, so the assertions below can be exact instead of the
+    // `.some()`/`toBeGreaterThanOrEqual` this file uses elsewhere to tolerate a
+    // shared window. With only ever one failure per window, the rest of this
+    // file can't distinguish "returns the right rows" from "returns whatever
+    // happens to be there". 8 failures, spaced 10 minutes apart, is the
+    // minimum shape that can catch: LIMIT 5 actually capping at 5 (not all 8),
+    // DESC picking the newest 5 (not the oldest 5 — what a missing ORDER BY or
+    // an ASC/DESC swap would surface instead), and strict recency order among
+    // the survivors (not insertion order, which happens to be ascending here).
+    const MARKER = "__TEST_DIGEST_MANY_FAILURES__";
+    const manyWindowStart = new Date("2030-01-01T00:00:00Z");
+    const manyWindowEnd = new Date("2030-01-01T08:00:00Z");
+    const base = new Date("2030-01-01T04:00:00Z");
+    const timestamps = Array.from({ length: 8 }, (_, i) => new Date(base.getTime() + i * 10 * 60_000));
+
+    // Defensive: clear out anything a previously-crashed run of this exact test
+    // left behind, so it's re-runnable on its own without manual DB cleanup.
+    await db.deleteFrom("collection_runs").where("error", "like", `${MARKER}%`).execute();
+
+    try {
+      await db
+        .insertInto("collection_runs")
+        .values(
+          timestamps.map((startedAt, i) => ({
+            status: "failed" as const,
+            started_at: startedAt,
+            error: `${MARKER}${i}`,
+          })),
+        )
+        .execute();
+
+      const stats = await computeDigestStats(db, manyWindowStart, manyWindowEnd);
+
+      expect(stats.recentFailures).toHaveLength(5);
+      // Newest-first: index 7 (latest) down to index 3.
+      expect(stats.recentFailures.map((f) => f.error)).toEqual([
+        `${MARKER}7`,
+        `${MARKER}6`,
+        `${MARKER}5`,
+        `${MARKER}4`,
+        `${MARKER}3`,
+      ]);
+      stats.recentFailures.forEach((f, i) => {
+        expect(f.startedAt.getTime()).toBe(timestamps[7 - i]?.getTime());
+      });
+    } finally {
+      await db.deleteFrom("collection_runs").where("error", "like", `${MARKER}%`).execute();
+    }
+  });
+
   it("returns zeros and an empty failures list for a window with no activity at all", async () => {
     const emptyWindow = { start: new Date("2020-01-01T00:00:00Z"), end: new Date("2020-01-01T01:00:00Z") };
     const stats = await computeDigestStats(db, emptyWindow.start, emptyWindow.end);

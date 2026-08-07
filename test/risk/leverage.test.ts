@@ -47,6 +47,11 @@ describe("checkLeverage", () => {
   it("throws RangeError instead of a veto when totalEquity is negative", () => {
     expect(() => checkLeverage(new Big("100"), new Big("-100"))).toThrow(RangeError);
   });
+
+  it("denies a negative shortNotional instead of silently allowing — a negative notional implies an upstream sign/subtraction bug and must fail closed, the same way totalEquity<=0 above and checkFundingBlackout's non-finite guard do", () => {
+    const result = checkLeverage(new Big("-100"), new Big("100"));
+    expectDenied(result, "LEVERAGE_NOTIONAL_IMPLAUSIBLE");
+  });
 });
 
 describe("checkAccountMMRate", () => {
@@ -100,5 +105,26 @@ describe("checkConcentration", () => {
   it("boundary: one minimal step over 25% is denied", () => {
     const result = checkConcentration(new Big("0.25000001"), new Big("1"));
     expectDenied(result, "CONCENTRATION_EXCEEDED");
+  });
+
+  it("denies a negative spotLegNotional instead of silently allowing — same one-sided-ceiling gap as checkLeverage would otherwise leave open: `.gt(CONCENTRATION_MAX)` never fires for a negative ratio, so this must fail closed before reaching that comparison", () => {
+    const result = checkConcentration(new Big("-30"), new Big("100"));
+    expectDenied(result, "CONCENTRATION_NOTIONAL_IMPLAUSIBLE");
+  });
+
+  // checkConcentration now guards `totalEquity <= 0` the same way checkLeverage
+  // in this same file does — a documented RangeError, not a veto outcome.
+  // checkConcentration is invoked directly by callers other than checkEntry
+  // (e.g. TEST-CASES.md #63 in test/risk/index.test.ts calls it standalone),
+  // so checkEntry's fixed check order (checkLeverage runs first and would
+  // already have thrown) cannot be relied on to protect every caller from a
+  // zero/negative-equity input reaching checkConcentration directly — the
+  // guard has to live here too.
+  it("totalEquity zero: throws the same documented RangeError as checkLeverage for the identical input shape", () => {
+    expect(() => checkConcentration(new Big("20"), new Big("0"))).toThrow(RangeError);
+  });
+
+  it("totalEquity negative: throws RangeError instead of silently allowing — dividing by a negative used to flip the sign, making concentration always <= CONCENTRATION_MAX", () => {
+    expect(() => checkConcentration(new Big("20"), new Big("-100"))).toThrow(RangeError);
   });
 });

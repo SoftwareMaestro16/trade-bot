@@ -1,5 +1,5 @@
 import { authorizeCommand } from "./telegram.js";
-import type { AuthorizedCommand, IncomingCommand, TelegramConfig } from "./telegram.js";
+import type { AuthorizedCommand, ChatAuthorizer, IncomingCommand, TelegramConfig } from "./telegram.js";
 
 /**
  * Long-polls Telegram's `getUpdates` for incoming kill-switch commands. This is
@@ -83,11 +83,14 @@ function parseUpdate(raw: unknown): ParsedUpdate {
 
 /**
  * Starts an indefinite getUpdates long-poll loop. Every update that carries
- * `message.text` is run through `authorizeCommand` and handed to `onCommand`
- * — both `authorized:true` and `authorized:false` results, always. Per
- * authorizeCommand's own JSDoc (RR-33, SRS.md), logging a rejection is the
- * caller's responsibility, not authorizeCommand's and not this function's:
- * `onCommand` is where that has to happen.
+ * `message.text` is run through `authorizeCommand` (awaited — `isAuthorizedChat`
+ * may hit the DB, see killswitch-listener.ts's own `isAuthorizedChat`) and
+ * handed to `onCommand` — both `authorized:true` and `authorized:false`
+ * results, always. Per authorizeCommand's own JSDoc (RR-33, SRS.md), logging
+ * a rejection is the caller's responsibility, not authorizeCommand's and not
+ * this function's: `onCommand` is where that has to happen. `onCommand`
+ * itself stays a synchronous callback — all the async work happens inside
+ * `pollOnce` before `onCommand` is ever invoked.
  *
  * Loop shape mirrors collector.ts's scheduleRepeating: a `stopped` flag that
  * gates every scheduled continuation, plus a timer handle stop() clears —
@@ -102,6 +105,7 @@ function parseUpdate(raw: unknown): ParsedUpdate {
  */
 export function startCommandPolling(
   config: TelegramConfig,
+  isAuthorizedChat: ChatAuthorizer,
   onCommand: (result: AuthorizedCommand) => void,
   options?: TelegramPollingOptions,
 ): TelegramPollingHandle {
@@ -190,10 +194,11 @@ export function startCommandPolling(
       }
       if (command !== undefined) {
         // Guarded for the same reason as the response.text() fix above: a
-        // caller bug in onCommand must not be able to kill this loop (and the
-        // whole process it runs in) over a single bad command.
+        // caller bug in onCommand (or in isAuthorizedChat, awaited inside
+        // authorizeCommand) must not be able to kill this loop (and the whole
+        // process it runs in) over a single bad command.
         try {
-          onCommand(authorizeCommand(config, command));
+          onCommand(await authorizeCommand(isAuthorizedChat, command));
         } catch (e) {
           console.error("[telegram-polling] onCommand handler threw:", e instanceof Error ? e.message : e);
         }

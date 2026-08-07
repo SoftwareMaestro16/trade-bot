@@ -329,6 +329,21 @@ export interface PaperEquitySnapshotsTable {
   is_peak: Generated<boolean>; // DEFAULT false
 }
 
+// ---------------------------------------------------------------------------
+// migrations/1786065891268_create-authorized-users.sql — additional Telegram
+// chat_ids the root admin (TelegramConfig.allowedChatId / env.TELEGRAM_CHAT_ID,
+// unchanged) has granted kill-switch command access to via /add. chat_id is
+// `text`, compared as an opaque string, same reasoning as everywhere else in
+// this file that touches a Telegram chat_id (see telegram.ts's
+// authorizeCommand doc comment) — never coerce through Number().
+// ---------------------------------------------------------------------------
+
+export interface AuthorizedUsersTable {
+  chat_id: string;
+  added_by: string;
+  added_at: ColumnType<Date, Date | undefined, never>;
+}
+
 export interface Database {
   collection_runs: CollectionRunsTable;
   funding_rates: FundingRatesTable;
@@ -351,4 +366,5 @@ export interface Database {
   paper_fills: PaperFillsTable;
   paper_funding_payments: PaperFundingPaymentsTable;
   paper_equity_snapshots: PaperEquitySnapshotsTable;
+  authorized_users: AuthorizedUsersTable;
 }

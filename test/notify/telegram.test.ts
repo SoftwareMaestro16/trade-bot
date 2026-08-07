@@ -1,7 +1,7 @@
 import nock from "nock";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { authorizeCommand, sendAlert, sendDocument, sendRichMessage, TelegramApiError } from "../../src/notify/telegram.js";
-import type { TelegramConfig } from "../../src/notify/telegram.js";
+import type { ChatAuthorizer, TelegramConfig } from "../../src/notify/telegram.js";
 
 const TELEGRAM_BASE = "https://api.telegram.org";
 // Deliberately eye-catching so a leak into an error's message/stack/serialized
@@ -270,32 +270,40 @@ describe("sendDocument (multipart/form-data, not JSON)", () => {
 });
 
 describe("authorizeCommand", () => {
-  const groupConfig: TelegramConfig = { botToken: FAKE_TOKEN, allowedChatId: "-100123456" };
+  // A stand-in ChatAuthorizer, not killswitch/authorizedUsers.ts's real
+  // isAuthorizedChat (that has its own DB-backed tests) — authorizeCommand
+  // itself must stay agnostic to WHERE the predicate's answer comes from, so
+  // these tests only ever assert on the predicate's return value / call args.
+  const alwaysAuthorized: ChatAuthorizer = () => Promise.resolve(true);
+  const neverAuthorized: ChatAuthorizer = () => Promise.resolve(false);
 
-  it("authorizes on an exact chat_id match, including a negative group chat_id, and parses a bare command", () => {
-    const result = authorizeCommand(groupConfig, { chatId: "-100123456", text: "/stop" });
-    expect(result).toEqual({ authorized: true, command: "stop", args: [] });
+  it("authorizes when the predicate resolves true, and parses a bare command", async () => {
+    const result = await authorizeCommand(alwaysAuthorized, { chatId: "-100123456", text: "/stop" });
+    expect(result).toEqual({ authorized: true, chatId: "-100123456", command: "stop", args: [] });
   });
 
-  it("rejects when chat_id does not match, reporting the rejected chat_id for the caller to log", () => {
-    const result = authorizeCommand(groupConfig, { chatId: "999", text: "/stop" });
+  it("rejects when the predicate resolves false, reporting the rejected chat_id for the caller to log", async () => {
+    const result = await authorizeCommand(neverAuthorized, { chatId: "999", text: "/stop" });
     expect(result).toEqual({ authorized: false, rejectedChatId: "999" });
   });
 
-  it("compares chat_id as strings, not numbers (RR-33: no Number() coercion)", () => {
-    const strictConfig: TelegramConfig = { botToken: FAKE_TOKEN, allowedChatId: "007" };
-    // "007" !== "7" as strings, even though Number("007") === Number("7").
-    const result = authorizeCommand(strictConfig, { chatId: "7", text: "/stop" });
-    expect(result).toEqual({ authorized: false, rejectedChatId: "7" });
+  it("calls the predicate with exactly incoming.chatId, as a plain string (RR-33: no Number() coercion)", async () => {
+    const isAuthorized = vi.fn(alwaysAuthorized);
+    // "007" as the incoming chat_id: if this were ever coerced through
+    // Number() anywhere between IncomingCommand and the predicate, the
+    // predicate would observe "7" instead — this pins down that it doesn't.
+    await authorizeCommand(isAuthorized, { chatId: "007", text: "/stop" });
+    expect(isAuthorized).toHaveBeenCalledTimes(1);
+    expect(isAuthorized).toHaveBeenCalledWith("007");
   });
 
-  it("parses a command with multiple arguments", () => {
-    const result = authorizeCommand(groupConfig, { chatId: "-100123456", text: "/status arg1 arg2" });
-    expect(result).toEqual({ authorized: true, command: "status", args: ["arg1", "arg2"] });
+  it("parses a command with multiple arguments", async () => {
+    const result = await authorizeCommand(alwaysAuthorized, { chatId: "-100123456", text: "/status arg1 arg2" });
+    expect(result).toEqual({ authorized: true, chatId: "-100123456", command: "status", args: ["arg1", "arg2"] });
   });
 
-  it("still authorizes text with no leading slash, parsing the first word as the command", () => {
-    const result = authorizeCommand(groupConfig, { chatId: "-100123456", text: "hello world" });
-    expect(result).toEqual({ authorized: true, command: "hello", args: ["world"] });
+  it("still authorizes text with no leading slash, parsing the first word as the command", async () => {
+    const result = await authorizeCommand(alwaysAuthorized, { chatId: "-100123456", text: "hello world" });
+    expect(result).toEqual({ authorized: true, chatId: "-100123456", command: "hello", args: ["world"] });
   });
 });

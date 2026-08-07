@@ -9,6 +9,8 @@ import type { Database } from "../../src/storage/schema.js";
 const TESTNET_BASE = "https://api-testnet.bybit.com";
 const TEST_SYMBOL = "__TEST_TICKERS__USDT";
 const OTHER_SYMBOL = "__TEST_TICKERS_OTHER__USDT"; // present on exchange, NOT in our universe
+const LINEAR_ONLY_SYMBOL = "__TEST_TICKERS_LINEAR_ONLY__USDT"; // in universe, spot response missing it this cycle
+const SPOT_ONLY_SYMBOL = "__TEST_TICKERS_SPOT_ONLY__USDT"; // in universe, linear response missing it this cycle
 
 function okResponse(result: unknown) {
   return { retCode: 0, retMsg: "OK", result, retExtInfo: {}, time: Date.now() };
@@ -29,9 +31,10 @@ describe("collectTickers (against a real local Postgres, mocked Bybit responses)
   });
 
   afterEach(async () => {
-    await db.deleteFrom("tickers").where("symbol", "in", [TEST_SYMBOL, OTHER_SYMBOL]).execute();
-    await db.deleteFrom("funding_rates").where("symbol", "in", [TEST_SYMBOL, OTHER_SYMBOL]).execute();
-    await db.deleteFrom("open_interest").where("symbol", "in", [TEST_SYMBOL, OTHER_SYMBOL]).execute();
+    const symbols = [TEST_SYMBOL, OTHER_SYMBOL, LINEAR_ONLY_SYMBOL, SPOT_ONLY_SYMBOL];
+    await db.deleteFrom("tickers").where("symbol", "in", symbols).execute();
+    await db.deleteFrom("funding_rates").where("symbol", "in", symbols).execute();
+    await db.deleteFrom("open_interest").where("symbol", "in", symbols).execute();
   });
 
   afterAll(async () => {
@@ -138,5 +141,77 @@ describe("collectTickers (against a real local Postgres, mocked Bybit responses)
     const result = await collectTickers(client, db, []);
 
     expect(result).toEqual({ tickersWritten: 0, fundingRatesWritten: 0, openInterestWritten: 0, symbolsCollected: 0 });
+  });
+
+  it("symbolsCollected reflects per-symbol linear+spot intersection, not row count, when a cycle is missing half its responses for some universe symbols (FR-109)", async () => {
+    // Universe has 3 symbols. This cycle: TEST_SYMBOL gets both linear+spot,
+    // LINEAR_ONLY_SYMBOL is missing from the spot response, SPOT_ONLY_SYMBOL is
+    // missing from the linear response. tickersWritten (4 of a possible 6 rows)
+    // looks like decent coverage; symbolsCollected must expose that only 1 of 3
+    // universe symbols actually got full linear+spot coverage this cycle.
+    nock(TESTNET_BASE)
+      .get("/v5/market/tickers")
+      .query((q) => q.category === "linear")
+      .reply(
+        200,
+        okResponse({
+          category: "linear",
+          list: [
+            { symbol: TEST_SYMBOL, lastPrice: "1", indexPrice: "1", markPrice: "1", volume24h: "1", turnover24h: "1", openInterest: "1", fundingRate: "0.0001", nextFundingTime: "1" },
+            { symbol: LINEAR_ONLY_SYMBOL, lastPrice: "2", indexPrice: "2", markPrice: "2", volume24h: "2", turnover24h: "2", openInterest: "2", fundingRate: "0.0002", nextFundingTime: "2" },
+            // SPOT_ONLY_SYMBOL deliberately absent here: linear response missed it this cycle.
+          ],
+        }),
+      );
+
+    nock(TESTNET_BASE)
+      .get("/v5/market/tickers")
+      .query((q) => q.category === "spot")
+      .reply(
+        200,
+        okResponse({
+          category: "spot",
+          list: [
+            { symbol: TEST_SYMBOL, lastPrice: "1", volume24h: "1", turnover24h: "1" },
+            { symbol: SPOT_ONLY_SYMBOL, lastPrice: "3", volume24h: "3", turnover24h: "3" },
+            // LINEAR_ONLY_SYMBOL deliberately absent here: spot response missed it this cycle.
+          ],
+        }),
+      );
+
+    const client = new PublicExchangeClient({ testnet: true });
+    const universe = [
+      { symbol: TEST_SYMBOL, fundingIntervalMinutes: 480 },
+      { symbol: LINEAR_ONLY_SYMBOL, fundingIntervalMinutes: 480 },
+      { symbol: SPOT_ONLY_SYMBOL, fundingIntervalMinutes: 480 },
+    ];
+
+    const result = await collectTickers(client, db, universe);
+
+    // 4 ticker rows written (TEST_SYMBOL x2, LINEAR_ONLY_SYMBOL linear, SPOT_ONLY_SYMBOL spot)
+    // could misleadingly read as ~near-full coverage by row count alone, but only
+    // TEST_SYMBOL actually cleared both category feeds this cycle.
+    expect(result).toEqual({
+      tickersWritten: 4,
+      fundingRatesWritten: 2, // linear-only loop: TEST_SYMBOL + LINEAR_ONLY_SYMBOL
+      openInterestWritten: 2, // same linear-only loop
+      symbolsCollected: 1, // only TEST_SYMBOL is in both linearSymbols and spotSymbols
+    });
+
+    const linearOnlyTickers = await db
+      .selectFrom("tickers")
+      .selectAll()
+      .where("symbol", "=", LINEAR_ONLY_SYMBOL)
+      .execute();
+    expect(linearOnlyTickers).toHaveLength(1);
+    expect(linearOnlyTickers[0]?.category).toBe("linear");
+
+    const spotOnlyTickers = await db
+      .selectFrom("tickers")
+      .selectAll()
+      .where("symbol", "=", SPOT_ONLY_SYMBOL)
+      .execute();
+    expect(spotOnlyTickers).toHaveLength(1);
+    expect(spotOnlyTickers[0]?.category).toBe("spot");
   });
 });

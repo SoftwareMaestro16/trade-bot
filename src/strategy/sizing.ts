@@ -26,9 +26,44 @@ export type SizingOutcome =
  * particular truncation this call happened to produce, per RISK-REGISTER.md's
  * exact formula. A notional that truncates to zero loss on this call can still
  * be vetoed, because the next poll's price will truncate differently.
+ *
+ * `targetNotional`, `markPrice`, and `perpQtyStep` must all be strictly
+ * positive, checked explicitly up front. Each one divides or multiplies into
+ * `residualDeltaFraction`: a zero `markPrice` or `perpQtyStep` zeroes the
+ * whole fraction (0 is never `>` a positive threshold, so the FM-12 guard
+ * below is silently defeated), and a non-positive `targetNotional` either
+ * zeroes it the same way or flips its sign (same effect — `.gt()` still never
+ * fires). Either way execution would otherwise fall through to the unguarded
+ * `targetNotional.div(markPrice)` / `rawQty.div(perpQtyStep)` divisions below
+ * and throw a raw Big.js division-by-zero, instead of failing closed with the
+ * same `{allowed:false, code, reason}` shape as every other rejection path in
+ * this module — the same "cannot evaluate, so deny" treatment
+ * `checkFundingBlackout` (risk/economics.ts) gives non-finite input.
  */
 export function sizePosition(input: SizingInput): SizingOutcome {
   const maxResidualDeltaFraction = input.maxResidualDeltaFraction ?? DEFAULT_MAX_RESIDUAL_DELTA;
+
+  if (input.targetNotional.lte(0)) {
+    return {
+      allowed: false,
+      code: "TARGET_NOTIONAL_NOT_POSITIVE",
+      reason: `targetNotional ${input.targetNotional.toString()} must be positive — a non-positive value defeats the FM-12 residual-delta guard below instead of being rejected outright (RISK-REGISTER.md FM-12).`,
+    };
+  }
+  if (input.markPrice.lte(0)) {
+    return {
+      allowed: false,
+      code: "MARK_PRICE_NOT_POSITIVE",
+      reason: `markPrice ${input.markPrice.toString()} must be positive — a non-positive value defeats the FM-12 residual-delta guard below instead of being rejected outright (RISK-REGISTER.md FM-12).`,
+    };
+  }
+  if (input.perpQtyStep.lte(0)) {
+    return {
+      allowed: false,
+      code: "PERP_QTY_STEP_NOT_POSITIVE",
+      reason: `perpQtyStep ${input.perpQtyStep.toString()} must be positive — a non-positive value defeats the FM-12 residual-delta guard below instead of being rejected outright (RISK-REGISTER.md FM-12).`,
+    };
+  }
 
   const residualDeltaFraction = input.perpQtyStep
     .div(2)

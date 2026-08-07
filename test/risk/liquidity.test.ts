@@ -58,6 +58,47 @@ describe("estimateSlippage", () => {
     expect(result.filledNotional.toString()).toBe("204");
     expect(result.slippageBp.toString()).toBe("0.02");
   });
+
+  /**
+   * Coverage gap: every other multi-level case above either consumes every
+   * level right down to the last one (the two-level exact-sum test) or never
+   * completes at all (the STRKUSDT book below is always exhausted before
+   * `remaining` reaches zero). None of them exercise the `if
+   * (remaining.lte(0)) break;` early-exit while the book still has a level
+   * left untouched — the branch that stops the walk from over-summing into
+   * `filledNotional`/`filledQty` once the target is satisfied, which feed the
+   * `averageFillPrice` that gates entries via checkSlippage's
+   * SLIPPAGE_TOO_HIGH veto (PARAMS-CONSERVATIVE.md §6).
+   *
+   * This book has 3 levels and the target notional is satisfied strictly
+   * inside the MIDDLE level (L2): L1 is fully consumed, L2 is only partially
+   * consumed (2 of its 6 qty units are taken, $250 of its $750 notional is
+   * left sitting there), and L3 ($1,300 of real depth) is never touched at
+   * all. If the break fired one level late (e.g. a refactor that summed each
+   * level's FULL notional instead of capping at `remaining` before relying
+   * on the break to stop) L2 would contribute $750 instead of the capped
+   * $500 and filledNotional would come out as $850, not $600 — this test
+   * would fail on that overshoot.
+   */
+  it("stops the walk inside the middle of a 3-level book, leaving the rest of that level and the whole next level unconsumed", () => {
+    const levels = [
+      { price: new Big("100"), qty: new Big("1") }, // L1 (first): 100 notional, fully consumed
+      { price: new Big("125"), qty: new Big("6") }, // L2 (middle): 750 notional, only 500 consumed
+      { price: new Big("130"), qty: new Big("10") }, // L3 (last): 1300 notional, untouched
+    ];
+    const totalBookNotional = new Big("100").plus(new Big("750")).plus(new Big("1300")); // 2150
+
+    const result = estimateSlippage(levels, new Big("600"));
+
+    expect(result.exhausted).toBe(false);
+    // Exact sum of L1 (100, full) + the capped partial of L2 (500 of its 750) only.
+    // Would be 850 if L2 were summed in full, or >850 if L3 leaked in too.
+    expect(result.filledNotional.toString()).toBe("600");
+    // avg fill price = 600 / (1 + 500/125) = 600 / 5 = 120; slippage vs best (100) = 20/100.
+    expect(result.slippageBp.toString()).toBe("0.2");
+    // Real depth genuinely remains unconsumed (L2's leftover 250 + all of L3's 1300).
+    expect(result.filledNotional.lt(totalBookNotional)).toBe(true);
+  });
 });
 
 /**

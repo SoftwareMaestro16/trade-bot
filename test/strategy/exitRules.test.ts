@@ -42,6 +42,15 @@ describe("checkExit", () => {
       });
       expect(result).toEqual({ shouldExit: false });
     });
+
+    it("does not exit exactly at the zero boundary (predictedNextFundingRate == 0, strictly-less required)", () => {
+      const result = checkExit({
+        ...baselineInput(),
+        predictedNextFundingRate: new Big("0"),
+        fundingPaymentsCollected: 5,
+      });
+      expect(result).toEqual({ shouldExit: false });
+    });
   });
 
   describe("reason 2 — APR_HYSTERESIS_TRIGGERED", () => {

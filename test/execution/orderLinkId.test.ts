@@ -28,6 +28,11 @@ describe("buildOrderLinkId", () => {
     expect(() => buildOrderLinkId({ epoch: 1.5, intentSeq: 0, leg: "spot" })).toThrow(RangeError);
   });
 
+  it("rejects a negative or non-integer intentSeq instead of silently truncating", () => {
+    expect(() => buildOrderLinkId({ epoch: 0, intentSeq: -1, leg: "spot" })).toThrow(RangeError);
+    expect(() => buildOrderLinkId({ epoch: 0, intentSeq: 1.5, leg: "spot" })).toThrow(RangeError);
+  });
+
   it("rejects an epoch or intentSeq beyond the fixed field width", () => {
     expect(() => buildOrderLinkId({ epoch: 1_000_000, intentSeq: 0, leg: "spot" })).toThrow(RangeError);
     expect(() => buildOrderLinkId({ epoch: 0, intentSeq: 100_000_000, leg: "spot" })).toThrow(RangeError);

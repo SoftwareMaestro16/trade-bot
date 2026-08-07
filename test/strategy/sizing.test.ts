@@ -68,6 +68,28 @@ describe("sizePosition", () => {
     expect(result.allowed).toBe(false);
   });
 
+  it("rejects markPrice = 0 with a controlled {allowed: false} instead of silently bypassing the FM-12 guard and throwing an unhandled Big.js division-by-zero", () => {
+    // markPrice is a multiplied (not divided) factor in residualDeltaFraction
+    // = perpQtyStep.div(2).times(markPrice).div(targetNotional), so at
+    // markPrice=0 that whole fraction would evaluate to exactly 0 — comfortably
+    // under maxResidualDeltaFraction, defeating the RESIDUAL_DELTA_EXCEEDED
+    // guard. The explicit upfront markPrice > 0 check now catches this before
+    // that fraction is even computed. markPrice is sourced from live/replayed
+    // market data (perpTicker.markPrice in scenarioRunner.ts) that this module
+    // cannot itself guarantee is positive, and callers branch on
+    // `sized.allowed` with no try/catch.
+    const result = sizePosition({
+      targetNotional: new Big("500"),
+      markPrice: new Big("0"),
+      perpQtyStep: new Big("0.001"),
+    });
+    expect(result.allowed).toBe(false);
+    if (!result.allowed) {
+      expect(result.code).toBe("MARK_PRICE_NOT_POSITIVE");
+      expect(result.reason).toContain("markPrice");
+    }
+  });
+
   it("accepts a custom maxResidualDeltaFraction override", () => {
     const strict = sizePosition({
       targetNotional: new Big("500"),
@@ -76,5 +98,56 @@ describe("sizePosition", () => {
       maxResidualDeltaFraction: new Big("0.00001"), // far stricter than the 0.0001 this scenario produces
     });
     expect(strict.allowed).toBe(false);
+  });
+
+  it("rejects a negative targetNotional with a controlled {allowed: false} instead of flipping residualDeltaFraction negative and approving a negative-quantity order", () => {
+    // Same inputs as the BTC-scale worked example above (which correctly denies at
+    // notional +500), but negated. Without the upfront targetNotional > 0 check, the
+    // sign flip on the division would make residualDeltaFraction negative, so
+    // `.gt(maxResidualDeltaFraction)` would always be false and the FM-12
+    // residual-delta check would be a no-op.
+    const result = sizePosition({
+      targetNotional: new Big("-500"),
+      markPrice: new Big("64725.90"),
+      perpQtyStep: new Big("0.001"),
+    });
+    expect(result.allowed).toBe(false);
+    if (!result.allowed) {
+      expect(result.code).toBe("TARGET_NOTIONAL_NOT_POSITIVE");
+      expect(result.reason).toContain("targetNotional");
+    }
+  });
+
+  it("rejects a zero targetNotional with a controlled {allowed: false} instead of throwing an unhandled Big.js division-by-zero error", () => {
+    const result = sizePosition({
+      targetNotional: new Big("0"),
+      markPrice: new Big("64725.90"),
+      perpQtyStep: new Big("0.001"),
+    });
+    expect(result.allowed).toBe(false);
+    if (!result.allowed) {
+      expect(result.code).toBe("TARGET_NOTIONAL_NOT_POSITIVE");
+      expect(result.reason).toContain("targetNotional");
+    }
+  });
+
+  it("rejects a zero perpQtyStep (e.g. ScenarioConfig.perpQtyStepBySymbol config typo) with a controlled {allowed: false} instead of throwing an unhandled Big.js division-by-zero error", () => {
+    // Without the upfront perpQtyStep > 0 check, residualDeltaFraction =
+    // perpQtyStep/2 * markPrice / targetNotional = 0/2 * price / notional = 0,
+    // which is never > maxResidualDeltaFraction, so the RESIDUAL_DELTA_EXCEEDED
+    // guard would never fire for this input — execution would fall through to
+    // `rawQty.div(input.perpQtyStep)`, dividing by zero. perpQtyStepBySymbol
+    // (src/emulation/scenarioRunner.ts) has no runtime validation, so a config
+    // typo of Big("0") for a symbol can reach this check.
+    const result = sizePosition({
+      targetNotional: new Big("500"),
+      markPrice: new Big("64725.90"),
+      perpQtyStep: new Big("0"),
+    });
+    expect(result.allowed).toBe(false);
+    if (!result.allowed) {
+      expect(result.code).toBe("PERP_QTY_STEP_NOT_POSITIVE");
+      expect(result.reason).toContain("perpQtyStep");
+    }
   });
 });

@@ -34,6 +34,26 @@ describe("normalizeFundingRateToR8h", () => {
     const result = normalizeFundingRateToR8h(new Big("0.0003"), 30);
     expect(result.toString()).toBe("0.0048");
   });
+
+  // FM-01 (RISK-REGISTER.md): the ±0.05%/8h entry-threshold gate depends on the sign
+  // of r8h being preserved — shorts pay longs on Bybit routinely (negative funding
+  // rate), and every fixture above is positive-only. A regression like an accidental
+  // .abs() or a downstream `rate >= 0` assumption would silently invert entry/exit
+  // risk decisions and nothing above would catch it.
+  it("rate=-0.0001, interval=60min -> r8h=-0.0008 (negative rate, sign preserved through more-frequent settlement)", () => {
+    const result = normalizeFundingRateToR8h(new Big("-0.0001"), 60);
+    expect(result.toString()).toBe("-0.0008");
+  });
+
+  it("rate=-0.0001, interval=240min -> r8h=-0.0002 (negative rate, sign preserved through less-frequent settlement)", () => {
+    const result = normalizeFundingRateToR8h(new Big("-0.0001"), 240);
+    expect(result.toString()).toBe("-0.0002");
+  });
+
+  it("rate=-0.0001, interval=480min -> r8h=-0.0001 (negative rate, identity at reference interval)", () => {
+    const result = normalizeFundingRateToR8h(new Big("-0.0001"), 480);
+    expect(result.toString()).toBe("-0.0001");
+  });
 });
 
 describe("r8hToApr", () => {
@@ -47,6 +67,25 @@ describe("r8hToApr", () => {
     const apr = r8hToApr(new Big("0.0002"));
     // 0.0002 * 1095 = 0.219 -> 21.9% APR, matches DECISIONS.md's worked example
     expect(apr.toString()).toBe("0.219");
+  });
+
+  // FM-01: negative r8h (shorts pay longs) must annualize to a negative APR, not be
+  // clamped or flipped — the entry-threshold gate compares this signed value against
+  // ±0.05%/8h and a sign bug here would silently invert the risk decision.
+  it("annualizes a negative r8h to a negative APR, sign preserved", () => {
+    const apr = r8hToApr(new Big("-0.0002"));
+    // -0.0002 * 1095 = -0.219
+    expect(apr.toString()).toBe("-0.219");
+  });
+
+  it("FM-01 composition: a negative per-interval rate normalized to r8h and annualized stays negative end-to-end", () => {
+    // Real Bybit fixture shape: negative funding rate at a non-reference interval,
+    // fed through both functions exactly as the entry-threshold gate would.
+    const r8h = normalizeFundingRateToR8h(new Big("-0.0001"), 240);
+    expect(r8h.toString()).toBe("-0.0002");
+    const apr = r8hToApr(r8h);
+    // -0.0002 * 1095 = -0.219
+    expect(apr.toString()).toBe("-0.219");
   });
 });
 

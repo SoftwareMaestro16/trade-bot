@@ -155,3 +155,62 @@ describe("computeRealizedPnlBreakdown", () => {
     expect(breakdown.total.toString()).toBe("6");
   });
 });
+
+describe("computeRealizedPnl / computeRealizedPnlBreakdown — negative grossFundingCollected (net funding paid, e.g. bot caught on the wrong side of a funding-rate flip over the hold)", () => {
+  it("passes a negative grossFundingCollected straight through as a loss when every other component is zero", () => {
+    const pnl = computeRealizedPnl({
+      entryLegNotional: new Big("1000"),
+      exitLegNotional: new Big("1000"),
+      entryBasis: new Big("0"),
+      exitBasis: new Big("0"),
+      grossFundingCollected: new Big("-25"),
+      totalFees: new Big("0"),
+      realizedSlippage: new Big("0"),
+    });
+    expect(pnl.toString()).toBe("-25");
+  });
+
+  it("a net-funding-paid trade turns an otherwise-profitable basis move net negative — the funding sign is carried through, not clamped or dropped", () => {
+    const input = {
+      entryLegNotional: new Big("10000"),
+      exitLegNotional: new Big("10000"),
+      entryBasis: new Big("-0.0005"),
+      exitBasis: new Big("-0.0015"), // basis component = +10 (favorable — same movement as the "widens" test above)
+      grossFundingCollected: new Big("-40"), // net PAID over the hold, not received
+      totalFees: new Big("31"),
+      realizedSlippage: new Big("5"),
+    };
+    const pnl = computeRealizedPnl(input);
+    // total: -40 + 10 - 31 - 5 = -66
+    expect(pnl.toString()).toBe("-66");
+    expect(pnl.lt(0)).toBe(true);
+
+    // Cross-check against the identical scenario with funding flipped to
+    // positive: the only difference should be exactly 2x the funding
+    // magnitude (80), proving the sign is carried through unmodified rather
+    // than e.g. silently abs()'d upstream of this function.
+    const pnlWithPositiveFunding = computeRealizedPnl({ ...input, grossFundingCollected: new Big("40") });
+    expect(pnlWithPositiveFunding.minus(pnl).toString()).toBe("80");
+  });
+
+  it("breakdown's fundingComponent preserves a negative input's sign as-is, unlike feesComponent/slippageComponent which are negated from a positive input", () => {
+    const input = {
+      entryLegNotional: new Big("10000"),
+      exitLegNotional: new Big("10000"),
+      entryBasis: new Big("0"),
+      exitBasis: new Big("0"),
+      grossFundingCollected: new Big("-40"),
+      totalFees: new Big("31"),
+      realizedSlippage: new Big("5"),
+    };
+    const breakdown = computeRealizedPnlBreakdown(input);
+    const directTotal = computeRealizedPnl(input);
+
+    expect(breakdown.fundingComponent.toString()).toBe("-40");
+    expect(breakdown.feesComponent.toString()).toBe("-31");
+    expect(breakdown.slippageComponent.toString()).toBe("-5");
+    // total: -40 + 0 - 31 - 5 = -76
+    expect(breakdown.total.toString()).toBe("-76");
+    expect(breakdown.total.toString()).toBe(directTotal.toString());
+  });
+});

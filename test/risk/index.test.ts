@@ -11,6 +11,30 @@ import { sizePosition } from "../../src/strategy/sizing.js";
 // composition test's.
 const deepBook = [{ price: new Big("100"), qty: new Big("1000000") }];
 
+// A book with enough TOTAL depth to fully fill targetNotional (1000) — so it
+// does NOT exhaust, unlike the empty-book fixtures used below — but whose
+// volume-weighted average fill price still lands far from the best price.
+// Level 1 alone covers only 100 of the 1000 target at the best price (100);
+// the remaining 900 must fill at a materially worse price, dragging the
+// average well past the 0.05% MAX_SLIPPAGE_BP ceiling (risk/liquidity.ts).
+// This isolates SLIPPAGE_TOO_HIGH from ORDERBOOK_DEPTH_EXHAUSTED, which the
+// existing perpBids:[]/spotAsks:[] tests below cannot do — an empty book is
+// always exhausted and can never reach the slippage-magnitude branch.
+//
+// Two directionally-correct variants, matching each leg's real book shape
+// (perp bids descend from best; spot asks ascend from best — see
+// risk/liquidity.ts's own "asks to buy, bids to sell" doc comment) — the
+// function is direction-agnostic, but using realistic shapes rules out this
+// fixture itself masking a side-specific wiring bug.
+const thinButSufficientBids = [
+  { price: new Big("100"), qty: new Big("1") }, // 100 notional at best price
+  { price: new Big("90"), qty: new Big("100") }, // 9000 notional at a much worse price — plenty to cover the rest
+];
+const thinButSufficientAsks = [
+  { price: new Big("100"), qty: new Big("1") }, // 100 notional at best price
+  { price: new Big("110"), qty: new Big("100") }, // 11000 notional at a much worse price — plenty to cover the rest
+];
+
 function goldenInput(): EntryCheckInput {
   return {
     projectedShortNotional: new Big("1000"),
@@ -99,6 +123,16 @@ describe("checkEntry — composition of all risk/ vetoes", () => {
   it("denies when the spot book cannot absorb the target notional", () => {
     const result = checkEntry({ ...goldenInput(), spotAsks: [] });
     expect(result).toMatchObject({ allowed: false, code: "ORDERBOOK_DEPTH_EXHAUSTED" });
+  });
+
+  it("denies with SLIPPAGE_TOO_HIGH (not ORDERBOOK_DEPTH_EXHAUSTED) when the perp book has enough depth to fill the target but the average fill price drifts too far from best — proves checkEntry actually feeds perpBids + targetNotional into the perp leg's slippage estimate, not just that an empty book denies", () => {
+    const result = checkEntry({ ...goldenInput(), perpBids: thinButSufficientBids });
+    expect(result).toMatchObject({ allowed: false, code: "SLIPPAGE_TOO_HIGH" });
+  });
+
+  it("denies with SLIPPAGE_TOO_HIGH (not ORDERBOOK_DEPTH_EXHAUSTED) when the spot book has enough depth to fill the target but the average fill price drifts too far from best — proves checkEntry actually feeds spotAsks + targetNotional into the spot leg's slippage estimate (and that the perp leg, still on deepBook here, doesn't mask it)", () => {
+    const result = checkEntry({ ...goldenInput(), spotAsks: thinButSufficientAsks });
+    expect(result).toMatchObject({ allowed: false, code: "SLIPPAGE_TOO_HIGH" });
   });
 
   it("denies on excessive leverage", () => {
