@@ -1,24 +1,30 @@
 import { pathToFileURL } from "node:url";
+import { assertUniverseNonEmpty, refreshUniverse } from "./collector/universe.js";
+import {
+  runLongShortRatioCycle,
+  runOrderbookCycle,
+  runSettledFundingCycle,
+  runTickersCycle,
+} from "./collector/collectionTasks.js";
+import { buildFreshnessChecks } from "./collector/heartbeatChecks.js";
 import { loadEnv } from "./config/env.js";
 import { PublicExchangeClient } from "./exchange/client.js";
 import { RateLimiter } from "./exchange/rateLimiter.js";
 import { logger as rootLogger } from "./logger.js";
 import { LiquidationCollector } from "./market-data/collectLiquidations.js";
-import { collectLongShortRatio } from "./market-data/collectLongShortRatio.js";
-import { collectOrderbookSnapshots } from "./market-data/collectOrderbookSnapshots.js";
-import { collectSettledFunding } from "./market-data/collectSettledFunding.js";
-import { collectTickers } from "./market-data/collectTickers.js";
 import { computeDigestStats } from "./market-data/collectionDigest.js";
-import { runCollectionCycle } from "./market-data/collectionRun.js";
 import { computeTradeableUniverse } from "./market-data/universe.js";
-import type { UniverseSymbol } from "./market-data/universe.js";
 import { scheduleDailyAt } from "./notify/dailySchedule.js";
 import { formatDigestTable } from "./notify/formatDigest.js";
 import { startHeartbeat } from "./notify/healthcheck.js";
-import type { FreshnessCheck } from "./notify/healthcheck.js";
 import { deliverPending, enqueueRichNotification } from "./notify/notificationQueue.js";
 import { scheduleRepeating, type ScheduledTask } from "./scheduleRepeating.js";
 import { createDb } from "./storage/db.js";
+
+// assertUniverseNonEmpty re-exported here (moved to ./collector/universe.ts)
+// so test/collector.test.ts's existing `import { assertUniverseNonEmpty }
+// from "../src/collector.js"` keeps resolving unchanged.
+export { assertUniverseNonEmpty };
 
 const logger = rootLogger.child({ module: "collector" });
 
@@ -110,35 +116,8 @@ const SHUTDOWN_WARN_AFTER_MS = 60_000;
 // the same way notify/dailySchedule.ts's scheduleDailyAt and
 // notify/healthcheck.ts's startHeartbeat already are.
 
-/**
- * Nothing downstream of computeTradeableUniverse ever checked
- * `universe.length > 0` before this existed: an empty result (e.g. an
- * upstream Bybit filter/schema change tripping FR-108's spot×perp
- * intersection to zero) would still wire up the WS liquidation subscription
- * and all 5 scheduleRepeating tasks below, and every cycle would run to
- * completion with symbolsCollected: 0 and collection_runs.status='completed'
- * — a fully silent total-collection failure, since runCollectionCycle has no
- * minimum-symbols check of its own and HEALTHCHECK_PING_URL (the only other
- * safety net) is optional and unset by default.
- *
- * Thrown, not just logged, at both call sites below: at startup this reaches
- * `main().catch` (fatal log + non-zero exit — a crash systemd/an operator can
- * actually see, instead of a healthy-looking process collecting nothing for
- * Phase 1's two-week window); inside the "universe-refresh" scheduleRepeating
- * task, scheduleRepeating's own try/catch (see its doc comment) turns this
- * into a logged "cycle failed" WITHOUT reassigning `universe` — so a single
- * bad refresh can never silently replace a good, previously-known-nonempty
- * universe with an empty one for the other 4 tasks' closures.
- */
-export function assertUniverseNonEmpty(universe: UniverseSymbol[]): void {
-  if (universe.length === 0) {
-    throw new Error(
-      "[collector] computeTradeableUniverse returned 0 tradeable symbols — refusing to run " +
-        "collectors against an empty universe (FR-108 expects roughly 293 mainnet spot×perp symbols; " +
-        "0 almost certainly means an upstream Bybit filter/schema change, not a real empty market)",
-    );
-  }
-}
+// assertUniverseNonEmpty moved to ./collector/universe.ts (see its own doc
+// comment there, moved verbatim) — re-exported above.
 
 async function main(): Promise<void> {
   const env = loadEnv();
@@ -173,69 +152,32 @@ async function main(): Promise<void> {
     scheduleRepeating(
       "universe-refresh",
       async () => {
-        const refreshed = await computeTradeableUniverse(client);
-        assertUniverseNonEmpty(refreshed);
-        universe = refreshed;
-        logger.info({ task: "universe-refresh", universeSymbols: universe.length }, "universe refreshed");
         // Deliberately NOT re-subscribing the liquidation WS here: dynamic
         // resubscription for a universe that changes rarely (instrument listings)
         // is not worth the added complexity in Phase 1. A daily process restart
         // (RUNBOOK, not yet written) picks up universe changes for that stream.
+        universe = await refreshUniverse(client);
       },
       UNIVERSE_REFRESH_INTERVAL_MS,
     ),
 
-    scheduleRepeating(
-      "tickers",
-      async () => {
-        await runCollectionCycle(db, universe.length, async () => {
-          const r = await collectTickers(client, db, universe);
-          return { symbolsCollected: r.symbolsCollected };
-        });
-      },
-      TICKER_INTERVAL_MS,
-    ),
+    scheduleRepeating("tickers", async () => runTickersCycle(client, db, universe), TICKER_INTERVAL_MS),
 
     scheduleRepeating(
       "orderbook",
-      async () => {
-        await runCollectionCycle(db, universe.length, async () => {
-          const r = await collectOrderbookSnapshots(client, db, universe, orderbookLimiter);
-          if (r.failed.length > 0) logger.error({ task: "orderbook", failed: r.failed }, "symbols failed");
-          return { symbolsCollected: r.symbolsCollected };
-        });
-      },
+      async () => runOrderbookCycle(client, db, universe, orderbookLimiter),
       ORDERBOOK_INTERVAL_MS,
     ),
 
     scheduleRepeating(
       "long-short-ratio",
-      async () => {
-        await runCollectionCycle(db, universe.length, async () => {
-          const r = await collectLongShortRatio(client, db, universe, longShortLimiter);
-          if (r.failed.length > 0) logger.error({ task: "long-short-ratio", failed: r.failed }, "symbols failed");
-          // Unlike tickers/orderbook, this endpoint writes at most ONE row per
-          // symbol (no linear/spot split), so `written` doesn't share those
-          // collectors' row-vs-symbol miscount. It can UNDERcount by the rare
-          // case of a symbol whose call succeeded but returned an empty list —
-          // treated as "not collected" here, which is a defensible reading
-          // (no data row exists for it this cycle either way), not the same
-          // arithmetic bug class that was fixed elsewhere.
-          return { symbolsCollected: r.written };
-        });
-      },
+      async () => runLongShortRatioCycle(client, db, universe, longShortLimiter),
       LONG_SHORT_INTERVAL_MS,
     ),
 
     scheduleRepeating(
       "settled-funding",
-      async () => {
-        await runCollectionCycle(db, universe.length, async () => {
-          const r = await collectSettledFunding(client, db, universe, settledFundingLimiter);
-          if (r.failed.length > 0) logger.error({ task: "settled-funding", failed: r.failed }, "symbols failed");
-          return { symbolsCollected: universe.length - r.failed.length };
-        });
-      },
+      async () => runSettledFundingCycle(client, db, universe, settledFundingLimiter),
       SETTLED_FUNDING_INTERVAL_MS,
     ),
   ];
@@ -324,44 +266,7 @@ async function main(): Promise<void> {
   // and for why these four checks (not six, not one) are exactly the
   // independently-scheduled write paths worth gating the ping on.
   if (env.HEALTHCHECK_PING_URL) {
-    const freshnessChecks: FreshnessCheck[] = [
-      {
-        label: "tickers",
-        staleAfterMs: DB_STALE_AFTER_MS,
-        latestAt: async (checkDb) => {
-          const row = await checkDb.selectFrom("tickers").select(({ fn }) => fn.max("fetched_at").as("latest")).executeTakeFirst();
-          return row?.latest ?? null;
-        },
-      },
-      {
-        label: "orderbook_levels",
-        staleAfterMs: DB_STALE_AFTER_MS,
-        latestAt: async (checkDb) => {
-          const row = await checkDb.selectFrom("orderbook_levels").select(({ fn }) => fn.max("fetched_at").as("latest")).executeTakeFirst();
-          return row?.latest ?? null;
-        },
-      },
-      {
-        label: "long_short_ratio",
-        staleAfterMs: SLOW_STREAM_STALE_AFTER_MS,
-        latestAt: async (checkDb) => {
-          const row = await checkDb.selectFrom("long_short_ratio").select(({ fn }) => fn.max("fetched_at").as("latest")).executeTakeFirst();
-          return row?.latest ?? null;
-        },
-      },
-      {
-        label: "funding_rates(settled)",
-        staleAfterMs: SLOW_STREAM_STALE_AFTER_MS,
-        latestAt: async (checkDb) => {
-          const row = await checkDb
-            .selectFrom("funding_rates")
-            .select(({ fn }) => fn.max("fetched_at").as("latest"))
-            .where("kind", "=", "settled")
-            .executeTakeFirst();
-          return row?.latest ?? null;
-        },
-      },
-    ];
+    const freshnessChecks = buildFreshnessChecks(DB_STALE_AFTER_MS, SLOW_STREAM_STALE_AFTER_MS);
     tasks.push(startHeartbeat(env.HEALTHCHECK_PING_URL, HEARTBEAT_INTERVAL_MS, db, freshnessChecks));
     logger.info(
       {

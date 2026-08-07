@@ -2,7 +2,7 @@ import path from "node:path";
 import pg from "pg";
 import { Kysely, PostgresDialect } from "kysely";
 import { loadEnv } from "./config/env.js";
-import { applyFlattenAll, applyHaltNew, clearHalt } from "./killswitch/haltState.js";
+import { applyHaltNew } from "./killswitch/haltState.js";
 import type { HaltState } from "./killswitch/haltState.js";
 import { selfTestFileFlag, startFileFlagWatcher } from "./killswitch/fileFlag.js";
 import { loadHaltState, saveHaltState } from "./killswitch/haltStatePersistence.js";
@@ -10,6 +10,8 @@ import { createPersistQueue } from "./killswitch/persistQueue.js";
 import { createInFlightTracker } from "./killswitch/inFlightPersists.js";
 import type { HaltStateDatabase } from "./killswitch/haltStatePersistence.js";
 import { isAuthorizedChat, manageAuthorizedUserCommand } from "./killswitch/authorizedUsers.js";
+import { routeAuthorizedCommand } from "./killswitch/commandRouter.js";
+import type { CommandRouterDeps } from "./killswitch/commandRouter.js";
 import { logger as rootLogger } from "./logger.js";
 import { sendAlert, sendRichMessage } from "./notify/telegram.js";
 import type { TelegramConfig } from "./notify/telegram.js";
@@ -249,8 +251,9 @@ async function main(): Promise<void> {
     const result = await manageAuthorizedUserCommand(statusDb, { command, senderChatId, rootAdminChatId, candidate });
     switch (result.outcome) {
       case "rejected_not_root_admin":
-        // Should be unreachable in practice — handleAuthorizedCommand's own
-        // "add"/"delete" case already checked this before calling here — but
+        // Should be unreachable in practice — routeAuthorizedCommand's own
+        // (killswitch/commandRouter.ts) "add"/"delete" case already checked
+        // this before calling here — but
         // logged loudly (not silently ignored) in case that invariant is
         // ever broken by a future edit to this file.
         logger.error({ command, senderChatId }, `/${command}: REJECTED — sender is not the root admin`);
@@ -277,85 +280,24 @@ async function main(): Promise<void> {
   }
 
   // RR-33 (extended): only a chat_id that's either the root admin or already
-  // in the authorized_users table ever reaches this function at all —
-  // isAuthorizedChat/authorizeCommand have already filtered by the time
-  // startCommandPolling calls onCommand. `chatId` is that already-authorized
-  // sender, needed here specifically for /add and /delete: those two
-  // commands are further restricted to ONLY the root admin, not every
-  // authorized chat_id — see the "add"/"delete" case below.
-  function handleAuthorizedCommand(command: string, args: string[], chatId: string): void {
-    switch (command) {
-      case "stop":
-        inFlightPersists.track(
-          applyAndPersist(
-            applyHaltNew(state, "manual /stop", "telegram", Date.now()),
-            "🛑 <b>HALT_NEW</b> — new entries blocked via /stop",
-          ),
-        );
-        break;
-
-      case "flatten":
-        inFlightPersists.track(
-          applyAndPersist(
-            applyFlattenAll(state, "manual /flatten", "telegram", Date.now()),
-            "🛑 <b>FLATTEN_ALL</b> — new entries blocked, closing everything, via /flatten " +
-              "(no execution/ order placement exists yet — this raises the flag for when it does)",
-          ),
-        );
-        break;
-
-      case "resume": {
-        const confirmedBy = `telegram:${args.join(" ") || "operator"}`;
-        try {
-          const cleared = clearHalt(state, confirmedBy, Date.now());
-          inFlightPersists.track(
-            applyAndPersist(cleared, `✅ Halt cleared via /resume (confirmed by ${confirmedBy})`),
-          );
-        } catch (e) {
-          logger.error({ err: e }, "/resume rejected");
-        }
-        break;
-      }
-
-      case "status":
-        void sendStatusReport();
-        break;
-
-      // Owner's own requirement: /add and /delete manage WHO can issue any
-      // of the commands above, so they must be restricted to the root admin
-      // ONLY — a chat_id merely present in authorized_users (and therefore
-      // already able to reach this function per the comment above) must NOT
-      // be able to authorize further chat_ids or de-authorize others. No
-      // reply is sent to the rejecting chat_id: there is no general
-      // "reply to an arbitrary chat_id" mechanism in this codebase (outbound
-      // sendAlert/sendRichMessage/sendDocument all target config.allowedChatId
-      // only, deliberately untouched by this change), so this is
-      // logged-and-silently-dropped, same as an RR-33 rejection.
-      case "add":
-      case "delete":
-        if (!telegramConfig) {
-          logger.error({ chatId, command, args }, `REJECTED /${command} — Telegram is not configured`);
-          break;
-        }
-        // The root-admin-only gate is also enforced inside
-        // manageAuthorizedUserCommand itself (manageAuthorizedUser above logs
-        // its "rejected_not_root_admin" outcome loudly if that ever
-        // triggers) — checked here too so a non-root sender's attempt is
-        // logged immediately, without an extra DB round trip.
-        if (chatId !== telegramConfig.allowedChatId) {
-          logger.error(
-            { chatId, command, args },
-            `REJECTED /${command} — only the root admin chat_id may manage authorized_users`,
-          );
-          break;
-        }
-        void manageAuthorizedUser(command, args[0], chatId, telegramConfig.allowedChatId);
-        break;
-
-      default:
-        logger.info({ command }, "unrecognized command");
-    }
-  }
+  // in the authorized_users table ever reaches routeAuthorizedCommand at
+  // all — isAuthorizedChat/authorizeCommand have already filtered by the
+  // time startCommandPolling calls onCommand. `chatId` is that
+  // already-authorized sender, needed there specifically for /add and
+  // /delete: those two commands are further restricted to ONLY the root
+  // admin, not every authorized chat_id — see killswitch/commandRouter.ts's
+  // own "add"/"delete" case for that gate (moved there along with the rest
+  // of the command-handling switch so it can be unit-tested with mock
+  // dependencies instead of only via a manual SSH smoke test).
+  const commandRouterDeps: CommandRouterDeps = {
+    getState: () => state,
+    inFlightPersists,
+    applyAndPersist,
+    sendStatusReport,
+    manageAuthorizedUser,
+    telegramConfig,
+    logger,
+  };
 
   // Owner's own request ("мемпул", verbatim: once the process "comes back to
   // itself" it should send what it should have sent) — mirrors collector.ts's
@@ -405,7 +347,7 @@ async function main(): Promise<void> {
           logger.error({ rejectedChatId: result.rejectedChatId }, "REJECTED command from unauthorized chat_id");
           return;
         }
-        handleAuthorizedCommand(result.command, result.args, result.chatId);
+        routeAuthorizedCommand(result.command, result.args, result.chatId, commandRouterDeps);
       },
     );
     logger.info("Telegram command polling started");
