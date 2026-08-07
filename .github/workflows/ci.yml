@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: timescale/timescaledb:2.29.1-pg18
+        env:
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: trade_bot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U user -d trade_bot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Минимально необходимые для loadEnv() dummy-значения — не реальные секреты.
+      APP_ENV: testnet
+      DATABASE_URL: postgresql://user:password@localhost:5432/trade_bot
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run database migrations
+        # Не npm run migrate:up: тот скрипт хардкодит --envPath .env, а его
+        # парсер ломается на .env-файлах с кириллицей. В CI .env вообще нет
+        # (gitignored) — DATABASE_URL приходит как настоящая process.env
+        # переменная (см. env: job выше), поэтому --envPath не нужен.
+        run: npx node-pg-migrate up -j sql
+
+      - name: Test
+        run: npm test

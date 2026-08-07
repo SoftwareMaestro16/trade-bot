@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import Big from "big.js";
 import { loadEnv } from "../config/env.js";
 import { generateReports } from "../emulation/reportGenerator.js";
@@ -42,6 +43,44 @@ const REPORTS_DIR = path.resolve(process.cwd(), "reports");
 // for most symbols) — printed as a loud caveat, never silently omitted.
 const MEANINGFUL_COVERAGE_HOURS = 7 * 24;
 
+// Pulled out as pure, exported functions (rather than left inline in main())
+// so the empty-table guard, the hours arithmetic, and the caveat-vs-silent
+// branch can be unit tested without standing up a DB connection — see
+// test/scripts/runEmulationScenario.test.ts.
+
+/**
+ * Resolves the observed tickers.fetched_at min/max into a concrete
+ * {startAt, endAt} pair. kysely's min()/max() aggregate to `null` over zero
+ * rows — an empty tickers table is a reachable runtime state (not one TS
+ * itself rules out), so this throws loudly instead of ever silently falling
+ * back to a synthetic range (e.g. `?? new Date()`), which would produce a
+ * nonsensical near-zero window instead of a clear failure.
+ */
+export function resolveObservedRange(range: { minAt: Date | null; maxAt: Date | null }): {
+  startAt: Date;
+  endAt: Date;
+} {
+  if (range.minAt === null || range.maxAt === null) {
+    throw new Error("[run-emulation] tickers table is empty — nothing to run a scenario against");
+  }
+  return { startAt: range.minAt, endAt: range.maxAt };
+}
+
+export function computeCoverageHours(startAt: Date, endAt: Date): number {
+  return (endAt.getTime() - startAt.getTime()) / (60 * 60 * 1000);
+}
+
+export function buildLowCoverageCaveat(coverageHours: number, thresholdHours: number): string | null {
+  if (coverageHours >= thresholdHours) {
+    return null;
+  }
+  return (
+    `[run-emulation] *** PRELIMINARY / LOW-CONFIDENCE RUN *** — only ${coverageHours.toFixed(1)}h of data ` +
+    `(${thresholdHours.toFixed(0)}h considered a bare minimum for a meaningful read). ` +
+    "Treat every number below as a pipeline smoke test, not a performance estimate."
+  );
+}
+
 async function main(): Promise<void> {
   const env = loadEnv();
   const db = createDb(env.DATABASE_URL);
@@ -52,12 +91,8 @@ async function main(): Promise<void> {
     .selectFrom("tickers")
     .select((eb) => [eb.fn.min("fetched_at").as("minAt"), eb.fn.max("fetched_at").as("maxAt")])
     .executeTakeFirstOrThrow();
-  if (range.minAt === null || range.maxAt === null) {
-    throw new Error("[run-emulation] tickers table is empty — nothing to run a scenario against");
-  }
-  const startAt = range.minAt;
-  const endAt = range.maxAt;
-  const coverageHours = (endAt.getTime() - startAt.getTime()) / (60 * 60 * 1000);
+  const { startAt, endAt } = resolveObservedRange(range);
+  const coverageHours = computeCoverageHours(startAt, endAt);
 
   // Re-derives the spot x perp intersection directly from what was actually
   // collected, rather than re-calling market-data/universe.ts's own
@@ -81,12 +116,9 @@ async function main(): Promise<void> {
   symbols.sort();
 
   console.log(`[run-emulation] ${String(symbols.length)} symbols, ${startAt.toISOString()} -> ${endAt.toISOString()} (${coverageHours.toFixed(1)}h observed)`);
-  if (coverageHours < MEANINGFUL_COVERAGE_HOURS) {
-    console.log(
-      `[run-emulation] *** PRELIMINARY / LOW-CONFIDENCE RUN *** — only ${coverageHours.toFixed(1)}h of data ` +
-        `(${(MEANINGFUL_COVERAGE_HOURS).toFixed(0)}h considered a bare minimum for a meaningful read). ` +
-        "Treat every number below as a pipeline smoke test, not a performance estimate.",
-    );
+  const lowCoverageCaveat = buildLowCoverageCaveat(coverageHours, MEANINGFUL_COVERAGE_HOURS);
+  if (lowCoverageCaveat !== null) {
+    console.log(lowCoverageCaveat);
   }
 
   const config: ScenarioConfig = {
@@ -122,7 +154,13 @@ async function main(): Promise<void> {
   await db.destroy();
 }
 
-main().catch((e) => {
-  console.error("[run-emulation] fatal:", e);
-  process.exit(1);
-});
+// Guarded so importing this module (e.g. test/scripts/runEmulationScenario.test.ts,
+// to exercise resolveObservedRange/computeCoverageHours/buildLowCoverageCaveat
+// in isolation) never triggers a real run — only a direct
+// `node .../runEmulationScenario.js` invocation does.
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((e) => {
+    console.error("[run-emulation] fatal:", e);
+    process.exit(1);
+  });
+}

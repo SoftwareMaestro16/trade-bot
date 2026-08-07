@@ -8,6 +8,7 @@ import { rankCandidates, computeCandidateYield } from "../strategy/rankCandidate
 import { checkExit } from "../strategy/exitRules.js";
 import { sizePosition } from "../strategy/sizing.js";
 import { normalizeFundingRateToR8h, r8hToApr } from "../market-data/normalizeFunding.js";
+import { latestLongShortRatioAtOrBefore } from "../market-data/collectLongShortRatio.js";
 import type { OrderbookLevel } from "../market-data/types.js";
 import { computeEquitySnapshot } from "./equityEngine.js";
 import { computeBorrowCost8h } from "./borrowCost.js";
@@ -241,6 +242,10 @@ interface OpenPositionState {
   fundingAppliedThroughMs: number;
   fundingAccrued: Big;
   fundingPaymentsCollected: number;
+  /** intervalMinutes of the most recently applied settled row — undefined until the first one is applied. Used only to size the gap-detection tolerance in applySettledFundingUpTo. */
+  lastSettledIntervalMinutes: number | undefined;
+  /** Set by applySettledFundingUpTo if a gap consistent with collectSettledFunding.ts's documented silent-drop scenarios (limit:5 first-poll, >200-row outage catch-up — see that file's doc comment) is ever suspected between two settled rows applied to this position. Surfaced in exit_reasoning so a downstream report reader knows this position's funding P&L may be understated rather than trusting it silently. */
+  fundingGapDetected: boolean;
   borrowCostAccrued: Big;
   lastBorrowAccrualMs: number;
   initialCapital: Big;
@@ -386,24 +391,6 @@ async function latestOpenInterestAtOrBefore(db: Kysely<Database>, symbol: string
     .executeTakeFirst();
   if (!row) return undefined;
   return new Big(row.open_interest);
-}
-
-/** Context-only, same reasoning as latestOpenInterestAtOrBefore above — collectLongShortRatio.ts's own sweep, never a veto input. */
-async function latestLongShortRatioAtOrBefore(
-  db: Kysely<Database>,
-  symbol: string,
-  t: Date,
-): Promise<LongShortRatioSnapshot | undefined> {
-  const row = await db
-    .selectFrom("long_short_ratio")
-    .selectAll()
-    .where("symbol", "=", symbol)
-    .where("fetched_at", "<=", t)
-    .orderBy("fetched_at", "desc")
-    .limit(1)
-    .executeTakeFirst();
-  if (!row) return undefined;
-  return { buyRatio: new Big(row.buy_ratio), sellRatio: new Big(row.sell_ratio) };
 }
 
 // ---------------------------------------------------------------------------
@@ -664,6 +651,8 @@ async function openNewPosition(
     fundingAppliedThroughMs: t.getTime(),
     fundingAccrued: new Big(0),
     fundingPaymentsCollected: 0,
+    lastSettledIntervalMinutes: undefined,
+    fundingGapDetected: false,
     borrowCostAccrued: new Big(0),
     lastBorrowAccrualMs: t.getTime(),
     initialCapital,
@@ -672,10 +661,43 @@ async function openNewPosition(
   };
 }
 
-/** Applies every settled funding settlement up to (and including) T — see module doc comment. */
+/**
+ * Applies every settled funding settlement up to (and including) T — see module doc comment.
+ *
+ * Gap detection: `settledFundingSince` is a plain time-range SELECT over
+ * kind='settled' rows with no completeness guarantee — collectSettledFunding.ts's
+ * own doc comment documents realistic scenarios (a symbol's first poll keeping only
+ * its 5 most recent settlements via `limit:5`/no `startTime`; an outage exceeding
+ * the `limit:200` catch-up window) where an individual settlement row is silently,
+ * permanently dropped and never revisited. Trusting whatever comes back as a
+ * complete record would then silently understate/misstate this position's funding
+ * P&L with no error or flag anywhere downstream. Flagged (not thrown/skipped, so
+ * one bad symbol doesn't abort an entire scenario run) whenever the elapsed time
+ * since the last-applied settlement exceeds a generous multiple of that prior
+ * settlement's own cadence — only once at least one real settlement has already
+ * been applied to this position, since `fundingAppliedThroughMs` at position-open
+ * is the OPEN time, not a settlement boundary, so the very first settlement's
+ * elapsed-since-open is expected to be at most one interval and must not trip this.
+ */
+const FUNDING_GAP_TOLERANCE_FACTOR = 1.5;
+
 async function applySettledFundingUpTo(db: Kysely<Database>, pos: OpenPositionState, t: Date): Promise<void> {
   const rows = await settledFundingSince(db, pos.symbol, pos.fundingAppliedThroughMs, t.getTime());
   for (const row of rows) {
+    if (pos.fundingPaymentsCollected > 0 && pos.lastSettledIntervalMinutes !== undefined) {
+      const elapsedMs = row.fundingTimestampMs - pos.fundingAppliedThroughMs;
+      const expectedMaxMs = pos.lastSettledIntervalMinutes * 60_000 * FUNDING_GAP_TOLERANCE_FACTOR;
+      if (elapsedMs > expectedMaxMs) {
+        pos.fundingGapDetected = true;
+        console.warn(
+          `[scenarioRunner] FUNDING GAP suspected symbol=${pos.symbol} positionId=${pos.id.toString()} ` +
+            `lastAppliedMs=${pos.fundingAppliedThroughMs} nextRowMs=${row.fundingTimestampMs} elapsedMs=${elapsedMs} ` +
+            `expectedIntervalMinutes=${pos.lastSettledIntervalMinutes} — collectSettledFunding.ts may have silently ` +
+            `dropped a settlement row in between (see that file's doc comment); reported funding P&L for this ` +
+            `position may be understated.`,
+        );
+      }
+    }
     const settleAt = new Date(row.fundingTimestampMs);
     // Price at the settlement instant, itself gated <= settleAt <= T — funding is
     // paid on the perp leg's notional at that instant (approximated via the
@@ -689,6 +711,7 @@ async function applySettledFundingUpTo(db: Kysely<Database>, pos: OpenPositionSt
     pos.fundingAccrued = pos.fundingAccrued.plus(amount);
     pos.fundingPaymentsCollected += 1;
     pos.fundingAppliedThroughMs = row.fundingTimestampMs;
+    pos.lastSettledIntervalMinutes = row.intervalMinutes;
 
     await db
       .insertInto("paper_funding_payments")
@@ -786,7 +809,11 @@ async function closePosition(
     `reasonCode=${reasonCode} r8hAtExit=${r8hAtExit?.toString() ?? "n/a"} ` +
     `aprAtExit=${r8hAtExit ? r8hToApr(r8hAtExit).toString() : "n/a"} basisAtExit=${exitBasis.toString()} ` +
     `exitPerpPrice=${exitPerpPrice.toString()} exitSpotPrice=${exitSpotPrice.toString()} ` +
-    `heldHours=${heldHours} fundingPaymentsCollected=${String(pos.fundingPaymentsCollected)}` +
+    `heldHours=${heldHours} fundingPaymentsCollected=${String(pos.fundingPaymentsCollected)} ` +
+    // See applySettledFundingUpTo's doc comment: true means a gap consistent with
+    // collectSettledFunding.ts's documented silent-drop scenarios was suspected
+    // during this hold — this position's funding P&L may be understated.
+    `fundingGapDetected=${String(pos.fundingGapDetected)}` +
     (reasonCode === "FORCED_LIQUIDATION" ? ` liquidationPrice=${exitPerpPrice.toString()}` : "") +
     ` detail=${reasonDetail}`;
 

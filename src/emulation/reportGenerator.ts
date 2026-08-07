@@ -430,6 +430,14 @@ async function fetchEquitySnapshots(db: Kysely<Database>, scenarioId: bigint): P
     .select(["at", "total_equity"])
     .where("scenario_id", "=", scenarioId)
     .orderBy("at", "asc")
+    // Tiebreaker for same-`at` rows: the "never leave a position open at
+    // range end" force-close (scenarioRunner.ts) writes a second snapshot at
+    // the same `at` as the main loop's last-tick snapshot when the winning
+    // candidate opens on the scenario's final tick. `id` is insertion-order
+    // (bigserial), and that force-close row is always inserted after the
+    // main loop's, so ordering by it deterministically picks the true final
+    // (post-close) equity over the stale still-open mark-to-market row.
+    .orderBy("id", "asc")
     .execute();
   return rows.map((r) => ({ at: r.at, totalEquity: new Big(r.total_equity) }));
 }
@@ -512,8 +520,19 @@ interface ScenarioVerdict {
 }
 
 function computeVerdict(trades: TradeRow[], netPnlUsd: Big): ScenarioVerdict {
-  const realityAdjustedLow = netPnlUsd.times(REALITY_ADJUST_LOW);
-  const realityAdjustedHigh = netPnlUsd.times(REALITY_ADJUST_HIGH);
+  // REALITY_ADJUST_LOW/HIGH encode "live is 30-50% worse than paper". For a paper GAIN,
+  // "worse" means the gain shrinks, so multiplying directly by 0.5/0.7 is correct. For a
+  // paper LOSS, "worse" means the loss deepens — multiplying by 0.5/0.7 would instead
+  // shrink the loss toward zero (backwards). Mirror the multiplier through 1 (i.e. use
+  // 2 - REALITY_ADJUST_X, which equals 1 + the same 30-50% degradation) so a loss grows
+  // by the same magnitude a gain would shrink by. "low" stays the more pessimistic
+  // (lower) figure and "high" the less pessimistic one in both cases.
+  const realityAdjustedLow = netPnlUsd.gte(0)
+    ? netPnlUsd.times(REALITY_ADJUST_LOW)
+    : netPnlUsd.times(new Big(2).minus(REALITY_ADJUST_LOW));
+  const realityAdjustedHigh = netPnlUsd.gte(0)
+    ? netPnlUsd.times(REALITY_ADJUST_HIGH)
+    : netPnlUsd.times(new Big(2).minus(REALITY_ADJUST_HIGH));
 
   const passedCount = trades.filter((t) => t.fundingUsd.gte(ENTRY_GROSS_MULTIPLIER.times(t.feesUsd.times(-1)))).length;
   const tradeCount = trades.length;
@@ -789,6 +808,10 @@ function buildNarrative(trade: TradeRow): string {
       entryParts.push(`long/short ratio ${sellRatio.div(buyRatio).toFixed(2)} — перекос в шорты`);
     } else if (buyRatio.eq(sellRatio)) {
       entryParts.push("long/short ratio без выраженного перекоса");
+    } else if (buyRatio.gt(sellRatio)) {
+      entryParts.push("long/short ratio: 100% лонги (шортов нет) — предельный перекос в лонги");
+    } else if (sellRatio.gt(buyRatio)) {
+      entryParts.push("long/short ratio: 100% шорты (лонгов нет) — предельный перекос в шорты");
     }
   }
   if (entryParts.length > 0) sentences.push(entryParts.join(", ") + ".");
@@ -827,7 +850,8 @@ function buildNarrative(trade: TradeRow): string {
 // Trades CSV
 // ---------------------------------------------------------------------------
 
-function csvEscapeField(value: string): string {
+/** RFC-4180 field escaping (quote/comma/CR/LF), shared with `exportPredictiveTrainingDataset.ts`. */
+export function csvEscapeField(value: string): string {
   if (/[",\r\n]/.test(value)) {
     return `"${value.replace(/"/g, '""')}"`;
   }

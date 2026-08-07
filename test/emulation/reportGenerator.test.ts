@@ -590,10 +590,13 @@ describe("generateReports", () => {
       // Scenario B: funding 0.1, basis -10, fees -0.205, net = 0.1 - 10 - 0.205 = -10.105
       expect(rowB[1]).toBe("2");
       expect(rowB[14]).toBe("-10.105"); // net_pnl_usd
-      expect(rowB[18]).toBe("-5.0525"); // reality_adjusted_pnl_low_usd = -10.105 * 0.5
+      // Loss scenario: reality adjustment must deepen the loss (live worse than paper),
+      // not shrink it toward zero — multiplier mirrors through 1, i.e. (2 - 0.5) = 1.5.
+      expect(rowB[18]).toBe("-15.1575"); // reality_adjusted_pnl_low_usd = -10.105 * 1.5
+      expect(rowB[19]).toBe("-13.1365"); // reality_adjusted_pnl_high_usd = -10.105 * 1.3
       expect(rowB[20]).toContain("не подтверждена");
       expect(rowB[20]).toContain("net_pnl_usd = -10.105");
-      expect(rowB[20]).toContain("reality_adjusted_pnl_low_usd = -5.0525");
+      expect(rowB[20]).toContain("reality_adjusted_pnl_low_usd = -15.1575");
       expect(rowB[20]).toContain("0/1"); // 0 of 1 trades passed the entry-margin check
       expect(rowB[20]).toContain("2x fees");
     },

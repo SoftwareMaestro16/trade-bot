@@ -1,3 +1,4 @@
+import Big from "big.js";
 import type { Kysely } from "kysely";
 import type { OpenInterestIntervalV5 } from "bybit-api";
 import type { PublicExchangeClient } from "../exchange/client.js";
@@ -11,6 +12,31 @@ const logger = rootLogger.child({ module: "collectLongShortRatio" });
 export interface CollectLongShortRatioResult {
   written: number;
   failed: string[];
+}
+
+/**
+ * Latest `long_short_ratio` row at-or-before `t`, mapped `buy_ratio`/`sell_ratio`
+ * -> `Big` (ADR-003). Shared by `emulation/scenarioRunner.ts` and
+ * `predictive/episodeExtraction.ts` (the latter passes `new Date(episodeStartMs)`)
+ * — both used to hand-mirror this query; consolidated here so a schema or
+ * mapping-convention change only has one call site to fix. Context-only in both
+ * callers, never a veto/feature gate on its own.
+ */
+export async function latestLongShortRatioAtOrBefore(
+  db: Kysely<Database>,
+  symbol: string,
+  t: Date,
+): Promise<{ buyRatio: Big; sellRatio: Big } | undefined> {
+  const row = await db
+    .selectFrom("long_short_ratio")
+    .select(["buy_ratio", "sell_ratio"])
+    .where("symbol", "=", symbol)
+    .where("fetched_at", "<=", t)
+    .orderBy("fetched_at", "desc")
+    .limit(1)
+    .executeTakeFirst();
+  if (!row) return undefined;
+  return { buyRatio: new Big(row.buy_ratio), sellRatio: new Big(row.sell_ratio) };
 }
 
 /**

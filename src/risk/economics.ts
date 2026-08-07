@@ -3,7 +3,10 @@ import { allow, deny } from "./types.js";
 import type { VetoResult } from "./types.js";
 
 const PREMIUM_DRIVEN_THRESHOLD_R8H = new Big("0.0005"); // +0.05%/8h, RISK-REGISTER.md FM-01
-const ENTRY_FLOOR_R8H = new Big("0.0002"); // 0.020%/8h — never 0.010%, PARAMS-CONSERVATIVE.md §5
+// Exported so non-live-trading consumers (offline report/label generation,
+// e.g. predictive/episodeExtraction.ts) can import the single source of
+// truth instead of hand-duplicating this literal.
+export const ENTRY_FLOOR_R8H = new Big("0.0002"); // 0.020%/8h — never 0.010%, PARAMS-CONSERVATIVE.md §5
 const ENTRY_GROSS_MULTIPLIER = new Big("2.0"); // K, RR-24/FM-01
 const DEFAULT_BLACKOUT_SECONDS = 60; // RISK-REGISTER.md FM-40
 // PARAMS-CONSERVATIVE.md §6: real VIP0 per-leg rates are ~0.055-0.10%

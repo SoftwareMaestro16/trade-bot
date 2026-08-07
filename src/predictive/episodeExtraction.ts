@@ -1,6 +1,8 @@
 import Big from "big.js";
 import type { Kysely } from "kysely";
 import { normalizeFundingRateToR8h } from "../market-data/normalizeFunding.js";
+import { latestLongShortRatioAtOrBefore } from "../market-data/collectLongShortRatio.js";
+import { ENTRY_FLOOR_R8H } from "../risk/economics.js";
 import type { Database } from "../storage/schema.js";
 import {
   computeFundingEpisodeFeatures,
@@ -77,10 +79,9 @@ import type {
  * (`episodeStartMs`) is the `fetched_at` of the FIRST predicted row in that
  * run (the first row where r8h crosses up to/above the floor, whether from
  * below the floor or from the very first predicted row on file for that
- * symbol). `ENTRY_FLOOR_R8H` is mirrored from `risk/economics.ts`, not
- * re-derived or re-hardcoded from scratch — see that constant's own comment
- * below for why it's duplicated rather than imported (same precedent as
- * `scripts/backfillFundingHistory.ts`'s own copy of this exact constant).
+ * symbol). `ENTRY_FLOOR_R8H` is imported from `risk/economics.ts`, not
+ * re-derived or re-hardcoded from scratch, so this module's episode-start
+ * detection and survival label always move with the live entry gate.
  * Because the floor (0.020%/8h) is itself strictly positive, "r8h >= floor"
  * already implies "funding is positive" — there is no separate sign check to
  * apply on top.
@@ -108,12 +109,6 @@ import type {
  *     hours]` — a collector gap spanning exactly this episode's window. Both
  *     cases mean "unknown", not "assume positive" or "assume negative".
  */
-
-// Mirrors risk/economics.ts's own ENTRY_FLOOR_R8H (PARAMS-CONSERVATIVE.md §5:
-// 0.020%/8h). Duplicated here, not imported: that constant isn't exported
-// from risk/economics.ts, and predictive/ isn't part of risk/'s module graph
-// — same precedent as scripts/backfillFundingHistory.ts's own copy.
-const ENTRY_FLOOR_R8H = new Big("0.0002");
 
 /** See module doc comment's "LABEL WINDOW" section for why 72h. */
 export const DEFAULT_LABEL_WINDOW_HOURS = 72;
@@ -191,22 +186,13 @@ async function fetchOpenInterestWindow(
   return rows.map((r) => ({ timestampMs: r.fetched_at.getTime(), openInterest: new Big(r.open_interest) }));
 }
 
-/** Latest-at-or-before-episode-start reading, same pattern as `scenarioRunner.ts`'s `latestLongShortRatioAtOrBefore` — context-only, gated the ordinary `fetched_at <= T` way. */
+/** Latest-at-or-before-episode-start reading — thin ms-to-Date wrapper around `market-data/collectLongShortRatio.ts`'s shared `latestLongShortRatioAtOrBefore`, same one `scenarioRunner.ts` uses. Context-only, gated the ordinary `fetched_at <= T` way. */
 async function fetchLongShortRatioAtStart(
   db: Kysely<Database>,
   symbol: string,
   episodeStartMs: number,
 ): Promise<LongShortRatioSample | undefined> {
-  const row = await db
-    .selectFrom("long_short_ratio")
-    .select(["buy_ratio", "sell_ratio"])
-    .where("symbol", "=", symbol)
-    .where("fetched_at", "<=", new Date(episodeStartMs))
-    .orderBy("fetched_at", "desc")
-    .limit(1)
-    .executeTakeFirst();
-  if (!row) return undefined;
-  return { buyRatio: new Big(row.buy_ratio), sellRatio: new Big(row.sell_ratio) };
+  return latestLongShortRatioAtOrBefore(db, symbol, new Date(episodeStartMs));
 }
 
 async function fetchLiquidationWindow(
@@ -296,11 +282,12 @@ async function computeSurvivalLabel(
 ): Promise<boolean | undefined> {
   const rows = await db
     .selectFrom("funding_rates")
-    .select(["rate", "interval_minutes"])
+    .select(["rate", "interval_minutes", "funding_timestamp_ms"])
     .where("symbol", "=", symbol)
     .where("kind", "=", "settled")
     .where("funding_timestamp_ms", ">", String(afterMsExclusive))
     .where("funding_timestamp_ms", "<=", String(uptoMsInclusive))
+    .orderBy("funding_timestamp_ms", "asc")
     .execute();
 
   if (rows.length === 0) {
@@ -312,6 +299,25 @@ async function computeSurvivalLabel(
     // this data, same treatment as the right-censored case.
     return undefined;
   }
+
+  // A non-empty row set can STILL be a partial, mid-window gap (same
+  // collector-gap mechanism as above, e.g. collectSettledFunding.ts's
+  // documented `limit:5` first-poll truncation) — some but not all expected
+  // settlements present, which must not silently read as "every present row
+  // is above floor, so survived". Walk the settlements in order and check
+  // each one's own `interval_minutes` says the next settlement was due no
+  // later than the following row (or, for the last row, the window's own
+  // inclusive end) — a due-but-missing settlement means unknowable, exactly
+  // like the zero-rows case above.
+  let previousMs = afterMsExclusive;
+  for (const row of rows) {
+    const fundingTimestampMs = Number(row.funding_timestamp_ms);
+    const intervalMs = row.interval_minutes * 60 * 1000;
+    if (fundingTimestampMs - previousMs > intervalMs) return undefined;
+    previousMs = fundingTimestampMs;
+  }
+  const tailIntervalMs = rows[rows.length - 1]!.interval_minutes * 60 * 1000;
+  if (uptoMsInclusive - previousMs >= tailIntervalMs) return undefined;
 
   return rows.every((r) => normalizeFundingRateToR8h(new Big(r.rate), r.interval_minutes).gte(ENTRY_FLOOR_R8H));
 }

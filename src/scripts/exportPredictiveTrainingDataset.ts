@@ -1,5 +1,7 @@
 import { writeFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
 import { loadEnv } from "../config/env.js";
+import { csvEscapeField } from "../emulation/reportGenerator.js";
 import { extractFundingEpisodes, listKnownSymbols } from "../predictive/episodeExtraction.js";
 import type { LabeledFundingEpisode } from "../predictive/episodeExtraction.js";
 import { createDb } from "../storage/db.js";
@@ -58,15 +60,11 @@ const CSV_HEADER = [
   "funding_vol_stddev_r8h",
 ];
 
-/** Minimal RFC-4180 escaping — every field this script writes is a decimal string, a plain enum ("up"/"down"/"flat"/"true"/"false"), or a symbol name; none is expected to contain a comma/quote/newline, but this guards against it regardless rather than assuming. */
-function csvEscape(value: string): string {
-  if (value.includes(",") || value.includes('"') || value.includes("\n")) {
-    return `"${value.replace(/"/g, '""')}"`;
-  }
-  return value;
-}
-
-function episodeToCsvRow(episode: LabeledFundingEpisode): string[] {
+// Exported (same convention as runEmulationScenario.ts's computeCoverageHours/
+// buildLowCoverageCaveat) purely so this and resolveSymbols below can be unit
+// tested without a DB connection — see
+// test/scripts/exportPredictiveTrainingDataset.test.ts.
+export function episodeToCsvRow(episode: LabeledFundingEpisode): string[] {
   const f = episode.features;
   const oi = f.openInterestTrend;
   const ls = f.longShortRatioAtStart;
@@ -98,10 +96,32 @@ function episodeToCsvRow(episode: LabeledFundingEpisode): string[] {
   ];
 }
 
+/**
+ * argv[3] override > top-of-file SYMBOLS const > listKnownSymbols(db)
+ * fallback — see this file's own doc comment's "CLI ARGUMENT CONVENTION"
+ * section. `fetchKnownSymbols` stands in for `() => listKnownSymbols(db)`:
+ * passed as a thunk (not an already-resolved list) so the DB is still only
+ * ever queried when actually needed, exactly the original inline ternary's
+ * laziness, while keeping this function testable without a DB connection.
+ */
+export async function resolveSymbols(
+  symbolsArg: string | undefined,
+  configuredSymbols: string[],
+  fetchKnownSymbols: () => Promise<string[]>,
+): Promise<string[]> {
+  if (symbolsArg) {
+    return symbolsArg
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+  }
+  return configuredSymbols.length > 0 ? configuredSymbols : fetchKnownSymbols();
+}
+
 function toCsv(episodes: LabeledFundingEpisode[]): string {
   const lines = [CSV_HEADER.join(",")];
   for (const episode of episodes) {
-    lines.push(episodeToCsvRow(episode).map(csvEscape).join(","));
+    lines.push(episodeToCsvRow(episode).map(csvEscapeField).join(","));
   }
   return `${lines.join("\n")}\n`;
 }
@@ -118,14 +138,7 @@ async function main(): Promise<void> {
   const env = loadEnv();
   const db = createDb(env.DATABASE_URL);
 
-  const symbols = symbolsArg
-    ? symbolsArg
-        .split(",")
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0)
-    : SYMBOLS.length > 0
-      ? SYMBOLS
-      : await listKnownSymbols(db);
+  const symbols = await resolveSymbols(symbolsArg, SYMBOLS, () => listKnownSymbols(db));
 
   console.log(`[export-predictive-dataset] ${symbols.length} symbols`);
 
@@ -145,7 +158,13 @@ async function main(): Promise<void> {
   await db.destroy();
 }
 
-main().catch((e) => {
-  console.error("[export-predictive-dataset] fatal:", e);
-  process.exit(1);
-});
+// Guarded so importing this module (e.g. test/scripts/exportPredictiveTrainingDataset.test.ts,
+// to exercise resolveSymbols/episodeToCsvRow in isolation) never triggers a
+// real run — only a direct `node .../exportPredictiveTrainingDataset.js`
+// invocation does. Same pattern as runEmulationScenario.ts.
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((e) => {
+    console.error("[export-predictive-dataset] fatal:", e);
+    process.exit(1);
+  });
+}
