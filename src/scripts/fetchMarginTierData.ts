@@ -1,5 +1,6 @@
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import type { MarginTierSource } from "../emulation/liquidation.js";
 import { PublicExchangeClient } from "../exchange/client.js";
 import { RateLimiter } from "../exchange/rateLimiter.js";
@@ -51,7 +52,7 @@ const OUTPUT_PATH = path.resolve(process.cwd(), "src/emulation/marginTierData.js
  * Field-for-field mirror of `emulation/liquidation.ts`'s `MarginTier`, with
  * the `Big`-valued fields as decimal strings (see module doc comment above).
  */
-interface MarginTierJson {
+export interface MarginTierJson {
   tier: number;
   riskLimitValue: string;
   maintenanceMarginRate: string;
@@ -67,7 +68,7 @@ interface FailedSymbol {
 }
 
 /** Intermediate row shape before `tier` (a per-symbol rank) is computed — see `fetchTiersForSymbol`'s own doc comment for why that can't come from the wire directly. */
-type UntieredRow = Omit<MarginTierJson, "tier">;
+export type UntieredRow = Omit<MarginTierJson, "tier">;
 
 /**
  * Fetches one symbol's full risk-limit tier ladder, following `nextPageCursor`
@@ -129,20 +130,30 @@ async function fetchTiersForSymbol(
     cursor = (response.result as { nextPageCursor?: string }).nextPageCursor || undefined;
   } while (cursor);
 
-  // Bybit's raw `id` field is a GLOBAL running counter across every symbol's
-  // rows in the entire risk-limit table, NOT a per-symbol tier rank — caught
-  // by live verification (2026-08-06): ADAUSDT's own lowest-risk row
-  // (isLowestRisk=1) carries id=116, not 1. It only LOOKED like a 1-based
-  // per-symbol rank for BTCUSDT, whose rows happen to occupy global ids 1-35.
-  // This module's own `MarginTier.tier` doc comment defines the field as
-  // "1-based rank within the symbol's ladder, ascending risk" — computed
-  // here by sorting on the NUMERIC riskLimitValue (a naive string sort would
-  // order "9000000" before "35000000") rather than trusting any id off the
-  // wire, matching liquidation.ts's own BTCUSDT_TIERS/ADAUSDT_TIERS numbering
-  // (tier 1..N, not id 1..35 / 116..145).
-  rows.sort((a, b) => Number(a.riskLimitValue) - Number(b.riskLimitValue));
+  return computeTierRanks(rows);
+}
 
-  return rows.map((row, i) => ({ tier: i + 1, ...row }));
+/**
+ * Bybit's raw `id` field is a GLOBAL running counter across every symbol's
+ * rows in the entire risk-limit table, NOT a per-symbol tier rank — caught
+ * by live verification (2026-08-06): ADAUSDT's own lowest-risk row
+ * (isLowestRisk=1) carries id=116, not 1. It only LOOKED like a 1-based
+ * per-symbol rank for BTCUSDT, whose rows happen to occupy global ids 1-35.
+ * This module's own `MarginTier.tier` doc comment defines the field as
+ * "1-based rank within the symbol's ladder, ascending risk" — computed here
+ * by sorting on the NUMERIC riskLimitValue (a naive string sort would order
+ * "9000000" before "35000000") rather than trusting any id off the wire,
+ * matching liquidation.ts's own BTCUSDT_TIERS/ADAUSDT_TIERS numbering
+ * (tier 1..N, not id 1..35 / 116..145).
+ *
+ * Pure and exported specifically so this ranking logic — which already
+ * caused one real, silently-wrong-data bug once — is unit-testable without
+ * a live Bybit call, even though the rest of this file is a one-off,
+ * manually-run script with no automated coverage otherwise.
+ */
+export function computeTierRanks(rows: readonly UntieredRow[]): MarginTierJson[] {
+  const sorted = [...rows].sort((a, b) => Number(a.riskLimitValue) - Number(b.riskLimitValue));
+  return sorted.map((row, i) => ({ tier: i + 1, ...row }));
 }
 
 async function main(): Promise<void> {
@@ -199,7 +210,17 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((e) => {
-  console.error("[fetch-margin-tiers] fatal:", e);
-  process.exit(1);
-});
+// Guards against main() running as a side effect of importing this module
+// for computeTierRanks (test/scripts/fetchMarginTierData.test.ts, or any
+// future import) — only a direct `node .../fetchMarginTierData.js`
+// invocation satisfies this, matching runEmulationScenario.ts's and
+// exportPredictiveTrainingDataset.ts's own identical guard. Found missing
+// here while adding the first test for this file: without it, importing
+// computeTierRanks alone triggered a real Bybit network call and would have
+// gone on to overwrite src/emulation/marginTierData.json.
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((e) => {
+    console.error("[fetch-margin-tiers] fatal:", e);
+    process.exit(1);
+  });
+}

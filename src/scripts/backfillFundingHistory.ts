@@ -1,5 +1,6 @@
 import Big from "big.js";
 import type { Insertable } from "kysely";
+import { pathToFileURL } from "node:url";
 import { loadEnv } from "../config/env.js";
 import { PublicExchangeClient } from "../exchange/client.js";
 import { RateLimiter } from "../exchange/rateLimiter.js";
@@ -149,7 +150,15 @@ async function main(): Promise<void> {
   await db.destroy();
 }
 
-main().catch((e) => {
-  console.error("[backfill] fatal:", e);
-  process.exit(1);
-});
+// Guards against main() running as a side effect of importing this module
+// (a future test, an editor's type-checking import graph, etc.) — only a
+// direct `node .../backfillFundingHistory.js` invocation satisfies this,
+// matching runEmulationScenario.ts's/exportPredictiveTrainingDataset.ts's/
+// fetchMarginTierData.ts's own identical guard. Without it, any import would
+// trigger a real Bybit network sweep and real DB writes.
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((e) => {
+    console.error("[backfill] fatal:", e);
+    process.exit(1);
+  });
+}
