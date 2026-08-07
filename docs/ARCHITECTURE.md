@@ -56,6 +56,14 @@ killswitch/      общая логика уровней (используетс�
 storage/         Kysely-клиент, миграции, репозитории по агрегатам
 notify/          Telegram: алерты, суточная сводка
 watchdog/        код heartbeat-клиента внутри trader; сам watchdog-процесс — отдельный деплой (см. §1)
+emulation/       Фаза 2 paper-trading: scenarioRunner (replay реальных данных с look-ahead дисциплиной, см. его
+                 собственный doc comment), reportGenerator, liquidation, borrowCost, equityEngine,
+                 adaptivePositionSizing — читает исторические данные market-data/, никогда не вызывает exchange/
+predictive/      офлайн-скелет предиктивной veto-модели (OPEN-QUESTIONS.md №22): извлечение признаков, ретро-
+                 спективная разметка эпизодов funding, интерфейс PredictiveVetoModel (сегодня NoOpVetoModel,
+                 нигде не подключён к реальному пути принятия решений)
+scripts/         одноразовые вручную запускаемые скрипты (backfill, fetch margin tiers, запуск emulation-сценария,
+                 экспорт обучающей выборки для predictive/) — не часть регулярного цикла collector.ts/trader
 ```
 
 **Контракт `strategy/` → `risk/` → `execution/`:** `strategy/` возвращает намерение (`OpenIntent { symbol, side, notionalUsdt, reasoning }`), никогда не вызывает биржу напрямую. `risk/` принимает намерение и либо пропускает, либо отклоняет с причиной (RR-28) — отклонение логируется как вето (FR-307: «все срабатывания вето risk/ с причинами»). Только после пропуска `execution/` создаёт запись в журнале намерений (RR-12) и лишь затем обращается к `exchange/`.
