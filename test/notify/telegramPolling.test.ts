@@ -261,4 +261,40 @@ describe("startCommandPolling", () => {
 
     expect(scope2.isDone()).toBe(false);
   });
+
+  it("aborts a getUpdates call that hangs past fetchTimeoutMs (black-holed connection), treats it as a failed attempt, and retries", async () => {
+    // Simulates a client-side-dead connection: nock never actually answers
+    // within this test's lifetime, standing in for a black-holed TCP
+    // connection with no RST. A real one would hang indefinitely; this one
+    // just has to outlast the short fetchTimeoutMs below.
+    const hungScope = nock(TELEGRAM_BASE).get(GET_UPDATES_PATH).query(true).delay(60_000).reply(200, updatesReply([]));
+    const recoveryScope = nock(TELEGRAM_BASE).get(GET_UPDATES_PATH).query(true).reply(200, updatesReply([]));
+    mockQuietTail();
+
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const handle = startCommandPolling(config, isAuthorizedChat, vi.fn(), {
+      fetchTimeoutMs: 100,
+      errorBackoffMs: 50,
+    });
+
+    await vi.waitFor(
+      () => {
+        expect(recoveryScope.isDone()).toBe(true);
+      },
+      { timeout: 2000 },
+    );
+
+    expect(hungScope.isDone()).toBe(true); // the hung request was actually sent, just never answered in time
+    expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("timed out after 100ms"));
+
+    // Same RR-33-adjacent token-leak discipline as the network-error test above.
+    for (const call of consoleErrorSpy.mock.calls) {
+      for (const arg of call) {
+        expect(String(arg)).not.toContain(FAKE_TOKEN);
+      }
+    }
+
+    void handle.stop();
+    consoleErrorSpy.mockRestore();
+  });
 });

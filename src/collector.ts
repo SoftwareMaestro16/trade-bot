@@ -1,3 +1,4 @@
+import { pathToFileURL } from "node:url";
 import { loadEnv } from "./config/env.js";
 import { PublicExchangeClient } from "./exchange/client.js";
 import { RateLimiter } from "./exchange/rateLimiter.js";
@@ -10,10 +11,12 @@ import { collectTickers } from "./market-data/collectTickers.js";
 import { computeDigestStats } from "./market-data/collectionDigest.js";
 import { runCollectionCycle } from "./market-data/collectionRun.js";
 import { computeTradeableUniverse } from "./market-data/universe.js";
+import type { UniverseSymbol } from "./market-data/universe.js";
 import { scheduleDailyAt } from "./notify/dailySchedule.js";
 import { formatDigestTable } from "./notify/formatDigest.js";
 import { startHeartbeat } from "./notify/healthcheck.js";
 import { deliverPending, enqueueRichNotification } from "./notify/notificationQueue.js";
+import { scheduleRepeating, type ScheduledTask } from "./scheduleRepeating.js";
 import { createDb } from "./storage/db.js";
 
 const logger = rootLogger.child({ module: "collector" });
@@ -82,62 +85,49 @@ const DB_STALE_AFTER_MS = 10 * 60_000;
 // 8 hours for its next retry attempt.
 const NOTIFICATION_RETRY_INTERVAL_MS = 15 * 60_000;
 
-interface ScheduledTask {
-  /**
-   * Resolves once any IN-FLIGHT `fn()` call has finished (and no further one
-   * will start) — not merely "no future tick is scheduled." `shutdown()` must
-   * await this before tearing down `db`: without it, a cycle that's mid-write
-   * when SIGTERM arrives races `db.destroy()`, which fails BOTH the success
-   * and the fallback failure UPDATE inside runCollectionCycle (Kysely's pool
-   * marks itself destroyed synchronously), leaving that row stuck at
-   * status='running' forever — indistinguishable from a real hang.
-   */
-  stop: () => Promise<void>;
-}
+// Purely diagnostic, not a forced cutoff (see shutdown()'s own doc comment for
+// why a forced deadline isn't safe here): if shutdown() is still waiting on
+// scheduled tasks this long after SIGTERM/SIGINT, log a warning so a hung REST
+// call (bybit-api's axios client defaults to a 5min timeout, unoverridden —
+// exchange/client.ts) leaves a trace in the journal before RUNBOOK.md's
+// systemd unit's default 90s TimeoutStopSec can SIGKILL the process with no
+// warning at all.
+const SHUTDOWN_WARN_AFTER_MS = 60_000;
+
+// ScheduledTask / scheduleRepeating moved to ./scheduleRepeating.ts (see its
+// own doc comments for the no-overlap / error-swallowing / drain-on-stop
+// guarantees) — extracted out of this file so it's independently testable
+// the same way notify/dailySchedule.ts's scheduleDailyAt and
+// notify/healthcheck.ts's startHeartbeat already are.
 
 /**
- * Runs `fn` repeatedly, waiting `intervalMs` after each run COMPLETES before
- * starting the next — never wall-clock ticks. This makes overlap structurally
- * impossible: a slow cycle simply pushes the next one back instead of racing it,
- * which would otherwise mean two concurrent writers for the same collector.
+ * Nothing downstream of computeTradeableUniverse ever checked
+ * `universe.length > 0` before this existed: an empty result (e.g. an
+ * upstream Bybit filter/schema change tripping FR-108's spot×perp
+ * intersection to zero) would still wire up the WS liquidation subscription
+ * and all 5 scheduleRepeating tasks below, and every cycle would run to
+ * completion with symbolsCollected: 0 and collection_runs.status='completed'
+ * — a fully silent total-collection failure, since runCollectionCycle has no
+ * minimum-symbols check of its own and HEALTHCHECK_PING_URL (the only other
+ * safety net) is optional and unset by default.
  *
- * A failure in `fn` is logged and does NOT stop the schedule (deliberately
- * different from RR-50's "unknown exception = halt" in a trading context — Phase 1
- * has no position at risk, so keeping the collector alive through a transient
- * failure serves FR-109's continuity goal better than stopping would; the failure
- * itself is still recorded, via runCollectionCycle writing collection_runs.status='failed').
+ * Thrown, not just logged, at both call sites below: at startup this reaches
+ * `main().catch` (fatal log + non-zero exit — a crash systemd/an operator can
+ * actually see, instead of a healthy-looking process collecting nothing for
+ * Phase 1's two-week window); inside the "universe-refresh" scheduleRepeating
+ * task, scheduleRepeating's own try/catch (see its doc comment) turns this
+ * into a logged "cycle failed" WITHOUT reassigning `universe` — so a single
+ * bad refresh can never silently replace a good, previously-known-nonempty
+ * universe with an empty one for the other 4 tasks' closures.
  */
-function scheduleRepeating(name: string, fn: () => Promise<void>, intervalMs: number): ScheduledTask {
-  const taskLogger = logger.child({ task: name });
-  let stopped = false;
-  let timer: NodeJS.Timeout | undefined;
-  let inFlight: Promise<void> = Promise.resolve();
-
-  const tick = async (): Promise<void> => {
-    if (stopped) return;
-    const attempt = (async () => {
-      try {
-        await fn();
-      } catch (e) {
-        taskLogger.error({ err: e }, "cycle failed");
-      }
-    })();
-    inFlight = attempt;
-    await attempt;
-    if (!stopped) {
-      timer = setTimeout(() => void tick(), intervalMs);
-    }
-  };
-
-  timer = setTimeout(() => void tick(), 0);
-
-  return {
-    stop: async () => {
-      stopped = true;
-      if (timer) clearTimeout(timer);
-      await inFlight;
-    },
-  };
+export function assertUniverseNonEmpty(universe: UniverseSymbol[]): void {
+  if (universe.length === 0) {
+    throw new Error(
+      "[collector] computeTradeableUniverse returned 0 tradeable symbols — refusing to run " +
+        "collectors against an empty universe (FR-108 expects roughly 293 mainnet spot×perp symbols; " +
+        "0 almost certainly means an upstream Bybit filter/schema change, not a real empty market)",
+    );
+  }
 }
 
 async function main(): Promise<void> {
@@ -159,6 +149,7 @@ async function main(): Promise<void> {
   const client = new PublicExchangeClient({ testnet: false });
 
   let universe = await computeTradeableUniverse(client);
+  assertUniverseNonEmpty(universe);
   logger.info({ appEnv: env.APP_ENV, universeSymbols: universe.length }, "startup");
 
   const liquidations = new LiquidationCollector(db, { testnet: false });
@@ -172,7 +163,9 @@ async function main(): Promise<void> {
     scheduleRepeating(
       "universe-refresh",
       async () => {
-        universe = await computeTradeableUniverse(client);
+        const refreshed = await computeTradeableUniverse(client);
+        assertUniverseNonEmpty(refreshed);
+        universe = refreshed;
         logger.info({ task: "universe-refresh", universeSymbols: universe.length }, "universe refreshed");
         // Deliberately NOT re-subscribing the liquidation WS here: dynamic
         // resubscription for a universe that changes rarely (instrument listings)
@@ -257,7 +250,7 @@ async function main(): Promise<void> {
     // scheduling anything new, so a message that failed because the process
     // itself was down goes out immediately on the next start rather than
     // waiting for the next digest/retry tick.
-    void deliverPending(db, telegramConfig)
+    const startupQueueFlush = deliverPending(db, telegramConfig)
       .then((r) => {
         if (r.delivered > 0 || r.stillFailing > 0) {
           logger.info(
@@ -267,6 +260,16 @@ async function main(): Promise<void> {
         }
       })
       .catch((e: unknown) => logger.error({ err: e, task: "startup" }, "pending Telegram queue flush failed"));
+    // Pushed into `tasks` (not just left as a dangling promise) so shutdown()'s
+    // `Promise.all(tasks.map(t=>t.stop()))` waits for this flush's in-flight DB
+    // write too, before `db.destroy()` runs — the same await-in-flight-before-
+    // destroy protection ScheduledTask.stop gives every other collector (see its
+    // own doc comment). Without this, a SIGTERM/SIGINT landing shortly after
+    // startup could race the delivered_at UPDATE inside deliverPending against
+    // pool teardown, which per notificationQueue.ts's own documented semantics
+    // (see its "sent to Telegram but failed to record delivered_at" branch)
+    // resends that message as a duplicate on the next start.
+    tasks.push({ stop: () => startupQueueFlush });
 
     tasks.push(
       scheduleDailyAt(DIGEST_HOURS_UTC, DIGEST_MINUTE_UTC, async () => {
@@ -322,22 +325,85 @@ async function main(): Promise<void> {
     logger.info({ task: "startup" }, "external heartbeat disabled (HEALTHCHECK_PING_URL not set)");
   }
 
+  // Guards against a second SIGTERM/SIGINT (double Ctrl+C from an impatient
+  // manual operator, a repeated `kill`, or SIGTERM+SIGINT arriving close
+  // together during a VPS intervention) re-entering shutdown() while the
+  // first call is still in flight — running tasks/liquidations/db teardown
+  // twice concurrently is not safe (e.g. LiquidationCollector.stop()'s
+  // `ws.closeAll()` on an already-closing socket).
+  let shuttingDown = false;
+
   const shutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) {
+      logger.info({ task: "shutdown", signal }, "shutdown already in progress, ignoring");
+      return;
+    }
+    shuttingDown = true;
     logger.info({ task: "shutdown", signal }, "received, stopping collectors...");
-    // Awaited, not fire-and-forget: db.destroy() below must never run while a
-    // cycle is still mid-write (see ScheduledTask.stop's own doc comment).
-    await Promise.all(tasks.map((task) => task.stop()));
-    await liquidations.stop();
-    await db.destroy();
-    logger.info({ task: "shutdown" }, "done");
-    process.exit(0);
+    try {
+      // liquidations.stop() runs CONCURRENTLY with tasks.map(stop), not after
+      // it. liquidations.stop() only closes the WS socket and drains a local
+      // buffer via `db` (see its own doc comment) — nothing in it depends on
+      // Bybit REST, so it must not sit gated behind whichever scheduled task's
+      // `fn()` happens to be mid-REST-call. Run strictly after (as this used
+      // to), a single hung REST call (bybit-api's axios client defaults to a
+      // 5min timeout that exchange/client.ts does not override) could keep the
+      // whole chain from ever reaching liquidations.stop(), and RUNBOOK.md's
+      // systemd unit sets no TimeoutStopSec override, so systemd's default 90s
+      // SIGKILL would very likely land first — losing whatever liquidation
+      // rows were still sitting in the BatchBuffer. Running it in parallel
+      // means the buffer gets its drain attempt regardless of how long any
+      // individual REST-bound task takes to stop.
+      //
+      // Both are still awaited, not fire-and-forget, and db.destroy() below
+      // still waits for both to settle unconditionally — deliberately no
+      // forced deadline on that wait. This file's own per-symbol sweep math
+      // (ORDERBOOK_CALL_SPACING_MS/LONG_SHORT_CALL_SPACING_MS doc comment
+      // above) puts a legitimate, non-hung full sweep's worst case in the same
+      // order of magnitude as systemd's 90s window once real REST latency is
+      // added on top of the fixed spacing — there is no deadline value here
+      // that's both short enough to reliably beat SIGKILL AND long enough to
+      // never cut off a healthy in-flight cycle, so forcing one would trade
+      // today's silent-SIGKILL failure mode for a self-inflicted
+      // db.destroy()-races-a-mid-write one (see ScheduledTask's own doc
+      // comment) on a perfectly healthy cycle. SHUTDOWN_WARN_AFTER_MS below is
+      // diagnostic only — it never cuts this wait short.
+      const shutdownWarnTimer = setTimeout(() => {
+        logger.warn(
+          { task: "shutdown", signal, warnAfterMs: SHUTDOWN_WARN_AFTER_MS },
+          "shutdown still waiting on scheduled tasks/liquidations — a REST call may be hung; " +
+            "systemd's default 90s TimeoutStopSec may SIGKILL before this finishes",
+        );
+      }, SHUTDOWN_WARN_AFTER_MS);
+      await Promise.all([Promise.all(tasks.map((task) => task.stop())), liquidations.stop()]);
+      clearTimeout(shutdownWarnTimer);
+      await db.destroy();
+      logger.info({ task: "shutdown" }, "done");
+      process.exit(0);
+    } catch (e) {
+      // There is no process.on("unhandledRejection") anywhere in this process,
+      // so letting any of the three awaited steps above reject here would be
+      // an unhandled rejection — depending on Node's unhandled-rejection mode
+      // that either crashes the process before db.destroy() runs, or leaves
+      // it hung with no scheduled work left but the event loop still alive.
+      // Logged and exited non-zero instead: systemd sees a real failure, and
+      // whatever DID complete above already ran.
+      logger.error({ err: e, task: "shutdown" }, "shutdown failed");
+      process.exit(1);
+    }
   };
 
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGINT", () => void shutdown("SIGINT"));
 }
 
-main().catch((e: unknown) => {
-  logger.error({ err: e, task: "fatal" }, "fatal error");
-  process.exit(1);
-});
+// Guarded so importing this module (e.g. test/collector.test.ts, to exercise
+// assertUniverseNonEmpty in isolation) never triggers a real run against the
+// live prod DB/Bybit — only a direct `node .../collector.js` invocation does.
+// Same pattern as scripts/runEmulationScenario.ts's own guard.
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((e: unknown) => {
+    logger.error({ err: e, task: "fatal" }, "fatal error");
+    process.exit(1);
+  });
+}

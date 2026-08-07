@@ -7,6 +7,7 @@ import type { HaltState } from "./killswitch/haltState.js";
 import { selfTestFileFlag, startFileFlagWatcher } from "./killswitch/fileFlag.js";
 import { loadHaltState, saveHaltState } from "./killswitch/haltStatePersistence.js";
 import { createPersistQueue } from "./killswitch/persistQueue.js";
+import { createInFlightTracker } from "./killswitch/inFlightPersists.js";
 import type { HaltStateDatabase } from "./killswitch/haltStatePersistence.js";
 import { isAuthorizedChat, manageAuthorizedUserCommand } from "./killswitch/authorizedUsers.js";
 import { logger as rootLogger } from "./logger.js";
@@ -90,9 +91,10 @@ async function main(): Promise<void> {
    * deciding the fact. Logged either way, so `journalctl` alone is always a
    * complete record even with Telegram fully down (RUNBOOK.md §4 fallback).
    *
-   * NEVER throws/rejects — every call site below is a bare `void
-   * applyAndPersist(...)` with nothing to attach a `.catch()` to. Before this
-   * was fixed, a transient `saveHaltState` failure (a DB connection reset,
+   * NEVER throws/rejects — every call site below is fire-and-forget
+   * (`inFlightPersists.track(applyAndPersist(...))`, see inFlightPersists.ts)
+   * with nothing that attaches a `.catch()` of its own. Before this was fixed,
+   * a transient `saveHaltState` failure (a DB connection reset,
    * say) was an unhandled promise rejection there — an uncaught exception in
    * Node by default, which killed this entire process, taking down BOTH
    * Level-1 paths (file-flag AND Telegram) over exactly the kind of hiccup an
@@ -107,6 +109,13 @@ async function main(): Promise<void> {
   // calls must commit in the order applyAndPersist was CALLED, not the order
   // their independent network round-trips happen to complete.
   const enqueuePersist = createPersistQueue();
+
+  // See inFlightPersists.ts's own doc comment: every call site below invokes
+  // applyAndPersist as `void applyAndPersist(...)` (deliberately — a slow
+  // persist must never block command handling), which otherwise leaves
+  // nothing for shutdown() to await before db.destroy() runs.
+  // inFlightPersists.track() is that missing handle; shutdown() drains it below.
+  const inFlightPersists = createInFlightTracker();
 
   async function applyAndPersist(next: HaltState, logLine: string): Promise<void> {
     state = next;
@@ -148,9 +157,11 @@ async function main(): Promise<void> {
   // (whose baseline would already read true, so it'd never see a transition
   // either) — silently unnoticed for as long as the file sits there.
   const fileFlagWatcher = startFileFlagWatcher({ flagFilePath: flagPath }, () => {
-    void applyAndPersist(
-      applyHaltNew(state, "file flag detected", "file-flag", Date.now()),
-      `🛑 <b>HALT_NEW</b> triggered via file flag (${flagPath})`,
+    inFlightPersists.track(
+      applyAndPersist(
+        applyHaltNew(state, "file flag detected", "file-flag", Date.now()),
+        `🛑 <b>HALT_NEW</b> triggered via file flag (${flagPath})`,
+      ),
     );
   });
 
@@ -235,17 +246,21 @@ async function main(): Promise<void> {
   function handleAuthorizedCommand(command: string, args: string[], chatId: string): void {
     switch (command) {
       case "stop":
-        void applyAndPersist(
-          applyHaltNew(state, "manual /stop", "telegram", Date.now()),
-          "🛑 <b>HALT_NEW</b> — new entries blocked via /stop",
+        inFlightPersists.track(
+          applyAndPersist(
+            applyHaltNew(state, "manual /stop", "telegram", Date.now()),
+            "🛑 <b>HALT_NEW</b> — new entries blocked via /stop",
+          ),
         );
         break;
 
       case "flatten":
-        void applyAndPersist(
-          applyFlattenAll(state, "manual /flatten", "telegram", Date.now()),
-          "🛑 <b>FLATTEN_ALL</b> — new entries blocked, closing everything, via /flatten " +
-            "(no execution/ order placement exists yet — this raises the flag for when it does)",
+        inFlightPersists.track(
+          applyAndPersist(
+            applyFlattenAll(state, "manual /flatten", "telegram", Date.now()),
+            "🛑 <b>FLATTEN_ALL</b> — new entries blocked, closing everything, via /flatten " +
+              "(no execution/ order placement exists yet — this raises the flag for when it does)",
+          ),
         );
         break;
 
@@ -253,7 +268,9 @@ async function main(): Promise<void> {
         const confirmedBy = `telegram:${args.join(" ") || "operator"}`;
         try {
           const cleared = clearHalt(state, confirmedBy, Date.now());
-          void applyAndPersist(cleared, `✅ Halt cleared via /resume (confirmed by ${confirmedBy})`);
+          inFlightPersists.track(
+            applyAndPersist(cleared, `✅ Halt cleared via /resume (confirmed by ${confirmedBy})`),
+          );
         } catch (e) {
           logger.error({ err: e }, "/resume rejected");
         }
@@ -332,19 +349,70 @@ async function main(): Promise<void> {
     );
   }
 
+  // Guards against a second SIGTERM/SIGINT (double Ctrl+C from an impatient
+  // operator, a repeated `kill`, or SIGTERM+SIGINT arriving close together
+  // during a VPS intervention) re-entering shutdown() while the first call is
+  // still in flight — a second concurrent db.destroy() is not safe (pg-pool's
+  // Pool.end() rejects if called again while the first call hasn't settled
+  // yet), and it's exactly the same class of hazard collector.ts's own
+  // shutdown() already guards against for the same reason — see that file's
+  // shuttingDown comment.
+  let shuttingDown = false;
+
   const shutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) {
+      logger.info({ signal }, "shutdown already in progress, ignoring");
+      return;
+    }
+    shuttingDown = true;
     logger.info({ signal }, "received, shutting down...");
-    fileFlagWatcher.stop();
-    // Awaited, not fire-and-forget: telegramPolling.stop() only resolves once
-    // any in-flight getUpdates round-trip (and whatever command dispatch it
-    // triggers) has actually finished. db.destroy() below must never run
-    // while a /stop or /flatten that arrived right at shutdown is still being
-    // persisted — otherwise that write can be aborted mid-flight by the
-    // closing pool and silently lost.
-    await telegramPolling?.stop();
-    await db.destroy();
-    logger.info("shutdown complete");
-    process.exit(0);
+    try {
+      fileFlagWatcher.stop();
+      // Awaited, not fire-and-forget: telegramPolling.stop() only resolves
+      // once any in-flight getUpdates round-trip — and the synchronous
+      // onCommand dispatch it triggers — has actually finished. That dispatch
+      // only reaches as far as `inFlightPersists.track(applyAndPersist(...))`
+      // though (see handleAuthorizedCommand's /stop, /flatten, /resume
+      // cases): the persist itself is a separate promise pollOnce() never
+      // awaits, so this alone does NOT guarantee a /stop or /flatten that
+      // arrived right at shutdown has finished being persisted — see
+      // inFlightPersists.drain() below, which is what actually closes that
+      // gap. telegramPolling.ts's own getUpdates fetch has its own
+      // AbortController timeout, so this can't hang forever on a black-holed
+      // connection.
+      await telegramPolling?.stop();
+      // Drains every applyAndPersist call still in flight — fed by both the
+      // file-flag path (whose watcher was already stopped above, so no new
+      // one can start after this point) and the Telegram path (same, via
+      // telegramPolling.stop() above). db.destroy() must never run while one
+      // of these is still mid-write: without this, a /stop or /flatten
+      // arriving right at shutdown could have its DB write silently aborted
+      // by the closing pool — no error, no log line, no trace in journalctl.
+      //
+      // Deliberately no forced deadline on this wait (or on db.destroy()
+      // below) — same reasoning collector.ts's own shutdown() already
+      // documents for its own no-deadline choice: there is no deadline value
+      // that's both short enough to reliably beat systemd's SIGKILL and long
+      // enough to never cut off a genuinely in-flight (not stuck) persist —
+      // forcing one here would trade today's "systemd SIGKILL after its own
+      // TimeoutStopSec" failure mode for a self-inflicted one that abandons a
+      // real halt/resume command's own write mid-flight on every restart that
+      // happens to race a slow-but-healthy persist.
+      await inFlightPersists.drain();
+      await db.destroy();
+      logger.info("shutdown complete");
+      process.exit(0);
+    } catch (e) {
+      // There is no process.on("unhandledRejection") anywhere in this
+      // process, so letting any of the awaited steps above reject here would
+      // be an unhandled rejection — the exact class of bug that could crash
+      // this process (the kill switch itself) on exactly the kind of DB/
+      // network hiccup an operator mid-incident can least afford. Logged and
+      // exited non-zero instead: systemd sees a real failure, and whatever
+      // DID complete above already ran.
+      logger.error({ err: e, signal }, "shutdown failed");
+      process.exit(1);
+    }
   };
 
   process.on("SIGTERM", () => void shutdown("SIGTERM"));

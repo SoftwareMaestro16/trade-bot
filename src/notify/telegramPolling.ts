@@ -16,6 +16,13 @@ export interface TelegramPollingOptions {
   timeoutSeconds?: number;
   /** Delay before retrying after a failed getUpdates attempt. Default 5000. */
   errorBackoffMs?: number;
+  /**
+   * Hard client-side deadline (via AbortController) on a single getUpdates
+   * round-trip. Defaults to `timeoutSeconds*1000 + FETCH_TIMEOUT_MARGIN_MS` —
+   * see pollOnce's own comment for why this exists at all. Overridable here
+   * only so tests don't have to wait out the real default.
+   */
+  fetchTimeoutMs?: number;
 }
 
 export interface TelegramPollingHandle {
@@ -32,6 +39,13 @@ export interface TelegramPollingHandle {
 
 const DEFAULT_TIMEOUT_SECONDS = 30;
 const DEFAULT_ERROR_BACKOFF_MS = 5000;
+// Margin added on top of the `timeout` query param to get the client-side
+// fetch deadline: generous enough that it should never fire on a legitimate
+// long-poll response (Telegram already holds the connection open up to
+// ~timeoutSeconds before answering; this is headroom for connect time + the
+// actual body of a real reply on top of that), while still being a real,
+// finite bound instead of none at all.
+const FETCH_TIMEOUT_MARGIN_MS = 15_000;
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
@@ -111,6 +125,7 @@ export function startCommandPolling(
 ): TelegramPollingHandle {
   const timeoutSeconds = options?.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS;
   const errorBackoffMs = options?.errorBackoffMs ?? DEFAULT_ERROR_BACKOFF_MS;
+  const fetchTimeoutMs = options?.fetchTimeoutMs ?? timeoutSeconds * 1000 + FETCH_TIMEOUT_MARGIN_MS;
 
   let stopped = false;
   // Telegram's own protocol: omit `offset` (or send 0) on the very first
@@ -138,17 +153,35 @@ export function startCommandPolling(
 
   /** One getUpdates round-trip. Returns true on success, false on any failure. */
   const pollOnce = async (): Promise<boolean> => {
+    // Node's global `fetch` has no default timeout, and the `timeout` query
+    // param in buildUrl() only bounds TELEGRAM's own server-side wait — never
+    // a client-side TCP connection that's gone dead with no RST. Without
+    // this, a black-holed connection at exactly the wrong moment can wedge
+    // this call (and therefore the awaited loopPromise behind
+    // TelegramPollingHandle.stop()) indefinitely, which in turn can stall
+    // killswitch-listener.ts's shutdown() well past what an operator expects.
+    // Covers both the fetch() call and the response.text() read below via the
+    // same signal — aborting mid-body-read rejects that too, not just a
+    // not-yet-started request.
+    const abortController = new AbortController();
+    const timeoutTimer = setTimeout(() => abortController.abort(), fetchTimeoutMs);
+
     let response: Response;
     try {
-      response = await fetch(buildUrl());
+      response = await fetch(buildUrl(), { signal: abortController.signal });
     } catch (e) {
+      clearTimeout(timeoutTimer);
       // Same discipline as telegram.ts's sendAlert: pull only `.message` out
       // of the caught value, never log `e` itself and never log the request
       // url — some fetch/undici failure shapes keep a reference back to the
       // request (and therefore to the token-bearing url) that an upstream
       // `console.error(error)` could otherwise echo straight into the log.
       const message = typeof e === "string" ? e : e instanceof Error ? e.message : "unrecognized error shape";
-      console.error(`[telegram-polling] getUpdates network error: ${message}`);
+      console.error(
+        abortController.signal.aborted
+          ? `[telegram-polling] getUpdates timed out after ${fetchTimeoutMs}ms (client-side deadline, not Telegram's own \`timeout\` param) — likely a dead/black-holed connection`
+          : `[telegram-polling] getUpdates network error: ${message}`,
+      );
       return false;
     }
 
@@ -163,10 +196,16 @@ export function startCommandPolling(
       // function runs in (killswitch-listener.ts, both Level-1 paths at once).
       rawBody = await response.text();
     } catch (e) {
+      clearTimeout(timeoutTimer);
       const message = typeof e === "string" ? e : e instanceof Error ? e.message : "unrecognized error shape";
-      console.error(`[telegram-polling] getUpdates response body read failed: ${message}`);
+      console.error(
+        abortController.signal.aborted
+          ? `[telegram-polling] getUpdates timed out after ${fetchTimeoutMs}ms (client-side deadline, not Telegram's own \`timeout\` param) — likely a dead/black-holed connection mid-body-read`
+          : `[telegram-polling] getUpdates response body read failed: ${message}`,
+      );
       return false;
     }
+    clearTimeout(timeoutTimer);
     const body = asRecord(safeJsonParse(rawBody));
     const description = body && typeof body.description === "string" ? body.description : undefined;
 
