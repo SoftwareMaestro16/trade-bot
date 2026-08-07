@@ -29,6 +29,7 @@ export interface CommandRouterDeps {
   applyAndPersist: (next: HaltState, logLine: string) => Promise<void>;
   sendStatusReport: () => Promise<void>;
   sendHelp: () => Promise<void>;
+  sendMenu: () => Promise<void>;
   manageAuthorizedUser: (
     command: "add" | "delete",
     candidate: string | undefined,
@@ -71,6 +72,10 @@ export const COMMAND_DOCS: readonly CommandDoc[] = [
   },
   { usage: "/add <chat_id>", description: "Добавляет chat_id в список авторизованных отправителей команд. Только root admin." },
   { usage: "/delete <chat_id>", description: "Убирает chat_id из списка авторизованных. Только root admin." },
+  {
+    usage: "/menu (или /start)",
+    description: "Быстрые кнопки-действия вместо набора команд текстом — см. killswitch/buttonRouter.ts.",
+  },
   { usage: "/help", description: "Этот список." },
 ];
 
@@ -88,6 +93,7 @@ export function routeAuthorizedCommand(command: string, args: string[], chatId: 
     applyAndPersist,
     sendStatusReport,
     sendHelp,
+    sendMenu,
     manageAuthorizedUser,
     telegramConfig,
     logger,
@@ -130,6 +136,11 @@ export function routeAuthorizedCommand(command: string, args: string[], chatId: 
 
     case "help":
       void sendHelp();
+      break;
+
+    case "menu":
+    case "start":
+      void sendMenu();
       break;
 
     // Owner's own requirement: /add and /delete manage WHO can issue any

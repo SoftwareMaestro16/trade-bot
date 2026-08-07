@@ -297,4 +297,145 @@ describe("startCommandPolling", () => {
     void handle.stop();
     consoleErrorSpy.mockRestore();
   });
+
+  describe("callback_query dispatch (inline keyboard button taps)", () => {
+    it("delivers a callback_query to onCallbackQuery, authorized, with data parsed as a bare command (no leading slash)", async () => {
+      const scope = nock(TELEGRAM_BASE)
+        .get(GET_UPDATES_PATH)
+        .query(true)
+        .reply(
+          200,
+          updatesReply([
+            {
+              update_id: 30,
+              callback_query: {
+                id: "cbq-1",
+                from: { id: 555000111 },
+                message: { message_id: 99, chat: { id: 555000111 } },
+                data: "stop_confirm",
+              },
+            },
+          ]),
+        );
+      mockQuietTail();
+
+      const onCommand = vi.fn();
+      const onCallbackQuery = vi.fn();
+      const handle = startCommandPolling(config, isAuthorizedChat, onCommand, undefined, onCallbackQuery);
+
+      await vi.waitFor(() => {
+        expect(onCallbackQuery).toHaveBeenCalledTimes(1);
+      });
+
+      expect(scope.isDone()).toBe(true);
+      expect(onCallbackQuery).toHaveBeenCalledWith({
+        auth: { authorized: true, chatId: "555000111", command: "stop_confirm", args: [] },
+        callbackQueryId: "cbq-1",
+        messageId: 99,
+      });
+      expect(onCommand).not.toHaveBeenCalled(); // a callback_query update must never also reach onCommand
+
+      void handle.stop();
+    });
+
+    it("still delivers a REJECTED callback_query to onCallbackQuery, for the caller to log (RR-33) — same as a typed command", async () => {
+      const scope = nock(TELEGRAM_BASE)
+        .get(GET_UPDATES_PATH)
+        .query(true)
+        .reply(
+          200,
+          updatesReply([
+            {
+              update_id: 31,
+              callback_query: {
+                id: "cbq-2",
+                from: { id: 999999999 }, // stranger chat_id
+                message: { message_id: 100, chat: { id: 999999999 } },
+                data: "status",
+              },
+            },
+          ]),
+        );
+      mockQuietTail();
+
+      const onCallbackQuery = vi.fn();
+      const handle = startCommandPolling(config, isAuthorizedChat, vi.fn(), undefined, onCallbackQuery);
+
+      await vi.waitFor(() => {
+        expect(onCallbackQuery).toHaveBeenCalledTimes(1);
+      });
+
+      expect(scope.isDone()).toBe(true);
+      expect(onCallbackQuery).toHaveBeenCalledWith({
+        auth: { authorized: false, rejectedChatId: "999999999" },
+        callbackQueryId: "cbq-2",
+        messageId: 100,
+      });
+
+      void handle.stop();
+    });
+
+    it("advances offset past a callback_query update, same as a message update", async () => {
+      const scope1 = nock(TELEGRAM_BASE)
+        .get(GET_UPDATES_PATH)
+        .query({ timeout: "30" })
+        .reply(
+          200,
+          updatesReply([
+            {
+              update_id: 40,
+              callback_query: {
+                id: "cbq-3",
+                from: { id: 555000111 },
+                message: { message_id: 1, chat: { id: 555000111 } },
+                data: "help",
+              },
+            },
+          ]),
+        );
+      const scope2 = nock(TELEGRAM_BASE).get(GET_UPDATES_PATH).query({ offset: "41", timeout: "30" }).reply(200, updatesReply([]));
+      mockQuietTail();
+
+      const handle = startCommandPolling(config, isAuthorizedChat, vi.fn(), undefined, vi.fn());
+
+      await vi.waitFor(() => {
+        expect(scope2.isDone()).toBe(true);
+      });
+      expect(scope1.isDone()).toBe(true);
+
+      void handle.stop();
+    });
+
+    it("does nothing (no throw, offset still advances) when onCallbackQuery is not provided at all", async () => {
+      const scope1 = nock(TELEGRAM_BASE)
+        .get(GET_UPDATES_PATH)
+        .query({ timeout: "30" })
+        .reply(
+          200,
+          updatesReply([
+            {
+              update_id: 50,
+              callback_query: {
+                id: "cbq-4",
+                from: { id: 555000111 },
+                message: { message_id: 1, chat: { id: 555000111 } },
+                data: "status",
+              },
+            },
+          ]),
+        );
+      const scope2 = nock(TELEGRAM_BASE).get(GET_UPDATES_PATH).query({ offset: "51", timeout: "30" }).reply(200, updatesReply([]));
+      mockQuietTail();
+
+      // No 5th argument at all — matches every pre-existing call site in this codebase before this feature.
+      const handle = startCommandPolling(config, isAuthorizedChat, vi.fn());
+
+      await vi.waitFor(() => {
+        expect(scope2.isDone()).toBe(true);
+      });
+      expect(scope1.isDone()).toBe(true);
+
+      void handle.stop();
+    });
+  });
 });

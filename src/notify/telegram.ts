@@ -12,6 +12,33 @@ export interface TelegramConfig {
 
 export interface SendAlertOptions {
   parseMode?: "Markdown" | "HTML";
+  replyMarkup?: InlineKeyboardMarkup;
+}
+
+/**
+ * Owner's own request: "внедрить inline кнопки нажимать и делать действия" —
+ * a plain data shape for Telegram's own `InlineKeyboardMarkup`
+ * (https://core.telegram.org/bots/api#inlinekeyboardmarkup). `callbackData`
+ * is deliberately a short bare string (no leading `/`, no args) — see
+ * killswitch/buttonRouter.ts's own doc comment for the exact vocabulary and
+ * why authorizeCommand can reuse it unmodified.
+ */
+export interface InlineKeyboardButton {
+  text: string;
+  callbackData: string;
+}
+
+export interface InlineKeyboardMarkup {
+  /** Rows of buttons, top to bottom; each inner array is one row, left to right. */
+  inlineKeyboard: InlineKeyboardButton[][];
+}
+
+function toWireKeyboard(markup: InlineKeyboardMarkup): { inline_keyboard: { text: string; callback_data: string }[][] } {
+  return {
+    inline_keyboard: markup.inlineKeyboard.map((row) =>
+      row.map((button) => ({ text: button.text, callback_data: button.callbackData })),
+    ),
+  };
 }
 
 /**
@@ -98,12 +125,20 @@ async function postToTelegram(url: string, payload: unknown, methodNameForErrors
 
 /** POSTs a single alert message to the configured chat. See `postToTelegram` for the shared failure discipline. */
 export async function sendAlert(config: TelegramConfig, text: string, options?: SendAlertOptions): Promise<void> {
-  const payload: { chat_id: string; text: string; parse_mode?: "Markdown" | "HTML" } = {
+  const payload: {
+    chat_id: string;
+    text: string;
+    parse_mode?: "Markdown" | "HTML";
+    reply_markup?: ReturnType<typeof toWireKeyboard>;
+  } = {
     chat_id: config.allowedChatId,
     text,
   };
   if (options?.parseMode) {
     payload.parse_mode = options.parseMode;
+  }
+  if (options?.replyMarkup) {
+    payload.reply_markup = toWireKeyboard(options.replyMarkup);
   }
   await postToTelegram(`https://api.telegram.org/bot${config.botToken}/sendMessage`, payload, "sendMessage");
 }
@@ -132,6 +167,85 @@ export async function sendRichMessage(config: TelegramConfig, markdown: string):
     rich_message: { markdown },
   };
   await postToTelegram(`https://api.telegram.org/bot${config.botToken}/sendRichMessage`, payload, "sendRichMessage");
+}
+
+export interface EditMessageOptions {
+  parseMode?: "Markdown" | "HTML";
+  /** Pass an empty InlineKeyboardMarkup ({inlineKeyboard: []}) to clear the buttons on this message entirely; omit to leave the existing keyboard untouched. */
+  replyMarkup?: InlineKeyboardMarkup;
+}
+
+/**
+ * Edits the text (and optionally the button row) of an already-sent
+ * message in place — the menu/confirm-flow's own mechanism (see
+ * killswitch/buttonRouter.ts) for turning "Stop new entries?" + [Yes]/[No]
+ * into "✅ Stopped." with no buttons, without spamming a new message for
+ * every tap. Always targets `config.allowedChatId`, same as every other
+ * outbound call in this file (see sendAlert/sendRichMessage) — the message
+ * being edited was sent to that chat in the first place, so `messageId`
+ * alone (Telegram scopes message_id per chat) is enough to identify it.
+ */
+export async function editMessageText(
+  config: TelegramConfig,
+  messageId: number,
+  text: string,
+  options?: EditMessageOptions,
+): Promise<void> {
+  const payload: {
+    chat_id: string;
+    message_id: number;
+    text: string;
+    parse_mode?: "Markdown" | "HTML";
+    reply_markup?: ReturnType<typeof toWireKeyboard>;
+  } = {
+    chat_id: config.allowedChatId,
+    message_id: messageId,
+    text,
+  };
+  if (options?.parseMode) {
+    payload.parse_mode = options.parseMode;
+  }
+  if (options?.replyMarkup) {
+    payload.reply_markup = toWireKeyboard(options.replyMarkup);
+  }
+  await postToTelegram(`https://api.telegram.org/bot${config.botToken}/editMessageText`, payload, "editMessageText");
+}
+
+export interface AnswerCallbackQueryOptions {
+  /** Short toast text shown to the tapping user. Omit for "just stop the loading spinner, no visible feedback." */
+  text?: string;
+  /** Show as a blocking alert dialog instead of a transient toast — reserved for something the user must acknowledge, not used by this codebase today. */
+  showAlert?: boolean;
+}
+
+/**
+ * MUST be called for every received callback_query, whether or not it led
+ * to any action — Telegram shows the tapped button as an indefinite loading
+ * spinner client-side until this is called (or ~a few seconds pass and it
+ * gives up with its own "query is too old" toast), regardless of whether
+ * this bot did anything with the tap. Never throws INTO the caller's own
+ * dispatch flow if it fails — see buttonRouter.ts's caller for why a failed
+ * answerCallbackQuery must not block the actual action from happening.
+ */
+export async function answerCallbackQuery(
+  config: TelegramConfig,
+  callbackQueryId: string,
+  options?: AnswerCallbackQueryOptions,
+): Promise<void> {
+  const payload: { callback_query_id: string; text?: string; show_alert?: boolean } = {
+    callback_query_id: callbackQueryId,
+  };
+  if (options?.text) {
+    payload.text = options.text;
+  }
+  if (options?.showAlert) {
+    payload.show_alert = options.showAlert;
+  }
+  await postToTelegram(
+    `https://api.telegram.org/bot${config.botToken}/answerCallbackQuery`,
+    payload,
+    "answerCallbackQuery",
+  );
 }
 
 export interface SendDocumentOptions {

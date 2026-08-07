@@ -1,7 +1,15 @@
 import nock from "nock";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { authorizeCommand, sendAlert, sendDocument, sendRichMessage, TelegramApiError } from "../../src/notify/telegram.js";
-import type { ChatAuthorizer, TelegramConfig } from "../../src/notify/telegram.js";
+import {
+  answerCallbackQuery,
+  authorizeCommand,
+  editMessageText,
+  sendAlert,
+  sendDocument,
+  sendRichMessage,
+  TelegramApiError,
+} from "../../src/notify/telegram.js";
+import type { ChatAuthorizer, InlineKeyboardMarkup, TelegramConfig } from "../../src/notify/telegram.js";
 
 const TELEGRAM_BASE = "https://api.telegram.org";
 // Deliberately eye-catching so a leak into an error's message/stack/serialized
@@ -37,6 +45,30 @@ describe("sendAlert", () => {
       .reply(200, { ok: true, result: { message_id: 2 } });
 
     await expect(sendAlert(config, "*bold*", { parseMode: "Markdown" })).resolves.toBeUndefined();
+    expect(scope.isDone()).toBe(true);
+  });
+
+  it("includes reply_markup, translated from camelCase inlineKeyboard/callbackData to Telegram's wire snake_case, when passed", async () => {
+    const keyboard: InlineKeyboardMarkup = {
+      inlineKeyboard: [
+        [{ text: "📊 Статус", callbackData: "status" }, { text: "❓ Помощь", callbackData: "help" }],
+        [{ text: "🛑 Stop", callbackData: "stop_confirm" }],
+      ],
+    };
+    const scope = nock(TELEGRAM_BASE)
+      .post(`/bot${FAKE_TOKEN}/sendMessage`, {
+        chat_id: config.allowedChatId,
+        text: "Быстрые действия:",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "📊 Статус", callback_data: "status" }, { text: "❓ Помощь", callback_data: "help" }],
+            [{ text: "🛑 Stop", callback_data: "stop_confirm" }],
+          ],
+        },
+      })
+      .reply(200, { ok: true, result: { message_id: 4 } });
+
+    await expect(sendAlert(config, "Быстрые действия:", { replyMarkup: keyboard })).resolves.toBeUndefined();
     expect(scope.isDone()).toBe(true);
   });
 
@@ -259,6 +291,103 @@ describe("sendDocument (multipart/form-data, not JSON)", () => {
     let caught: unknown;
     try {
       await sendDocument(config, "paper_summary_run1.md", "# report");
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeInstanceOf(TelegramApiError);
+    const serialized = JSON.stringify(caught, Object.getOwnPropertyNames(caught));
+    expect(serialized).not.toContain(FAKE_TOKEN);
+  });
+});
+
+describe("editMessageText", () => {
+  it("POSTs chat_id, message_id and text to editMessageText", async () => {
+    const scope = nock(TELEGRAM_BASE)
+      .post(`/bot${FAKE_TOKEN}/editMessageText`, {
+        chat_id: config.allowedChatId,
+        message_id: 42,
+        text: "✅ HALT_NEW включён.",
+      })
+      .reply(200, { ok: true, result: {} });
+
+    await expect(editMessageText(config, 42, "✅ HALT_NEW включён.")).resolves.toBeUndefined();
+    expect(scope.isDone()).toBe(true);
+  });
+
+  it("includes an empty reply_markup.inline_keyboard when passed an empty InlineKeyboardMarkup (clears the buttons)", async () => {
+    const scope = nock(TELEGRAM_BASE)
+      .post(`/bot${FAKE_TOKEN}/editMessageText`, {
+        chat_id: config.allowedChatId,
+        message_id: 42,
+        text: "done",
+        reply_markup: { inline_keyboard: [] },
+      })
+      .reply(200, { ok: true, result: {} });
+
+    await editMessageText(config, 42, "done", { replyMarkup: { inlineKeyboard: [] } });
+    expect(scope.isDone()).toBe(true);
+  });
+
+  it("includes parse_mode when passed", async () => {
+    const scope = nock(TELEGRAM_BASE)
+      .post(`/bot${FAKE_TOKEN}/editMessageText`, {
+        chat_id: config.allowedChatId,
+        message_id: 7,
+        text: "<b>bold</b>",
+        parse_mode: "HTML",
+      })
+      .reply(200, { ok: true, result: {} });
+
+    await editMessageText(config, 7, "<b>bold</b>", { parseMode: "HTML" });
+    expect(scope.isDone()).toBe(true);
+  });
+
+  it("rejects with TelegramApiError on HTTP 500, and never leaks the bot token", async () => {
+    nock(TELEGRAM_BASE).post(`/bot${FAKE_TOKEN}/editMessageText`).reply(500, "Internal Server Error");
+
+    let caught: unknown;
+    try {
+      await editMessageText(config, 1, "text");
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeInstanceOf(TelegramApiError);
+    const serialized = JSON.stringify(caught, Object.getOwnPropertyNames(caught));
+    expect(serialized).not.toContain(FAKE_TOKEN);
+  });
+});
+
+describe("answerCallbackQuery", () => {
+  it("POSTs only callback_query_id when no options are given", async () => {
+    const scope = nock(TELEGRAM_BASE)
+      .post(`/bot${FAKE_TOKEN}/answerCallbackQuery`, { callback_query_id: "cbq-1" })
+      .reply(200, { ok: true, result: true });
+
+    await expect(answerCallbackQuery(config, "cbq-1")).resolves.toBeUndefined();
+    expect(scope.isDone()).toBe(true);
+  });
+
+  it("includes text (toast) and show_alert when passed", async () => {
+    const scope = nock(TELEGRAM_BASE)
+      .post(`/bot${FAKE_TOKEN}/answerCallbackQuery`, {
+        callback_query_id: "cbq-2",
+        text: "Остановлено",
+        show_alert: true,
+      })
+      .reply(200, { ok: true, result: true });
+
+    await answerCallbackQuery(config, "cbq-2", { text: "Остановлено", showAlert: true });
+    expect(scope.isDone()).toBe(true);
+  });
+
+  it("rejects with TelegramApiError on HTTP 500, and never leaks the bot token", async () => {
+    nock(TELEGRAM_BASE).post(`/bot${FAKE_TOKEN}/answerCallbackQuery`).reply(500, "Internal Server Error");
+
+    let caught: unknown;
+    try {
+      await answerCallbackQuery(config, "cbq-3");
     } catch (e) {
       caught = e;
     }

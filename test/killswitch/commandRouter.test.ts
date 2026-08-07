@@ -20,6 +20,7 @@ function makeDeps(overrides?: Partial<CommandRouterDeps>): CommandRouterDeps & {
   applyAndPersist: ReturnType<typeof vi.fn>;
   sendStatusReport: ReturnType<typeof vi.fn>;
   sendHelp: ReturnType<typeof vi.fn>;
+  sendMenu: ReturnType<typeof vi.fn>;
   manageAuthorizedUser: ReturnType<typeof vi.fn>;
   logger: Logger;
 } {
@@ -31,6 +32,7 @@ function makeDeps(overrides?: Partial<CommandRouterDeps>): CommandRouterDeps & {
     applyAndPersist: vi.fn().mockResolvedValue(undefined),
     sendStatusReport: vi.fn().mockResolvedValue(undefined),
     sendHelp: vi.fn().mockResolvedValue(undefined),
+    sendMenu: vi.fn().mockResolvedValue(undefined),
     manageAuthorizedUser: vi.fn().mockResolvedValue(undefined),
     telegramConfig: null,
     logger: makeLogger(),
@@ -42,6 +44,7 @@ function makeDeps(overrides?: Partial<CommandRouterDeps>): CommandRouterDeps & {
       applyAndPersist: ReturnType<typeof vi.fn>;
       sendStatusReport: ReturnType<typeof vi.fn>;
       sendHelp: ReturnType<typeof vi.fn>;
+      sendMenu: ReturnType<typeof vi.fn>;
       manageAuthorizedUser: ReturnType<typeof vi.fn>;
       logger: Logger;
     };
@@ -135,6 +138,23 @@ describe("routeAuthorizedCommand", () => {
     expect(deps.inFlightPersists.track).not.toHaveBeenCalled();
   });
 
+  it("/menu: delegates to sendMenu and does not touch applyAndPersist", () => {
+    const deps = makeDeps();
+
+    routeAuthorizedCommand("menu", [], ROOT_ADMIN, deps);
+
+    expect(deps.sendMenu).toHaveBeenCalledTimes(1);
+    expect(deps.applyAndPersist).not.toHaveBeenCalled();
+  });
+
+  it("/start: also delegates to sendMenu (alias for /menu)", () => {
+    const deps = makeDeps();
+
+    routeAuthorizedCommand("start", [], ROOT_ADMIN, deps);
+
+    expect(deps.sendMenu).toHaveBeenCalledTimes(1);
+  });
+
   it("/add: rejects (logged, no reply) when Telegram is not configured", () => {
     const deps = makeDeps({ telegramConfig: null });
 
@@ -200,6 +220,7 @@ describe("routeAuthorizedCommand", () => {
     expect(deps.applyAndPersist).not.toHaveBeenCalled();
     expect(deps.sendStatusReport).not.toHaveBeenCalled();
     expect(deps.sendHelp).not.toHaveBeenCalled();
+    expect(deps.sendMenu).not.toHaveBeenCalled();
     expect(deps.manageAuthorizedUser).not.toHaveBeenCalled();
     expect(deps.inFlightPersists.track).not.toHaveBeenCalled();
   });

@@ -12,9 +12,11 @@ import type { HaltStateDatabase } from "./killswitch/haltStatePersistence.js";
 import { isAuthorizedChat, manageAuthorizedUserCommand } from "./killswitch/authorizedUsers.js";
 import { COMMAND_DOCS, routeAuthorizedCommand } from "./killswitch/commandRouter.js";
 import type { CommandRouterDeps } from "./killswitch/commandRouter.js";
+import { MENU_KEYBOARD, MENU_TEXT, routeCallbackQuery } from "./killswitch/buttonRouter.js";
+import type { ButtonRouterDeps } from "./killswitch/buttonRouter.js";
 import { logger as rootLogger } from "./logger.js";
-import { sendAlert, sendRichMessage } from "./notify/telegram.js";
-import type { TelegramConfig } from "./notify/telegram.js";
+import { answerCallbackQuery, editMessageText, sendAlert, sendRichMessage } from "./notify/telegram.js";
+import type { InlineKeyboardMarkup, TelegramConfig } from "./notify/telegram.js";
 import { deliverPending, enqueueNotification } from "./notify/notificationQueue.js";
 import { startCommandPolling } from "./notify/telegramPolling.js";
 import type { TelegramPollingHandle } from "./notify/telegramPolling.js";
@@ -251,6 +253,43 @@ async function main(): Promise<void> {
   }
 
   /**
+   * Owner's own request: "поработай над интерфейсом бота чтобы он не был
+   * скудным... реализовать команды в inline кнопках" — sends the tappable
+   * menu (killswitch/buttonRouter.ts's MENU_KEYBOARD). Uses plain sendAlert
+   * (HTML parse mode, reply_markup), not sendRichMessage: reply_markup is a
+   * sendMessage-family field, unrelated to Bot API 10.1's separate
+   * rich_message mechanism /status and /help use for their tables.
+   */
+  async function sendMenu(): Promise<void> {
+    if (!telegramConfig) return;
+    try {
+      await sendAlert(telegramConfig, MENU_TEXT, { replyMarkup: MENU_KEYBOARD });
+    } catch (e) {
+      logger.error({ err: e }, "failed to send menu");
+    }
+  }
+
+  /** Edits the tapped button's own message in place — see buttonRouter.ts's ButtonRouterDeps. Never throws: a failed edit must not block the action routeCallbackQuery already took. */
+  async function editMenuMessage(messageId: number, text: string, keyboard: InlineKeyboardMarkup): Promise<void> {
+    if (!telegramConfig) return;
+    try {
+      await editMessageText(telegramConfig, messageId, text, { replyMarkup: keyboard });
+    } catch (e) {
+      logger.error({ err: e }, "failed to edit menu message");
+    }
+  }
+
+  /** See notify/telegram.ts's answerCallbackQuery doc comment: must be called for every tap, and must never throw into the caller's dispatch flow. */
+  async function answerCallback(callbackQueryId: string, toastText?: string): Promise<void> {
+    if (!telegramConfig) return;
+    try {
+      await answerCallbackQuery(telegramConfig, callbackQueryId, toastText ? { text: toastText } : undefined);
+    } catch (e) {
+      logger.error({ err: e }, "failed to answer callback query");
+    }
+  }
+
+  /**
    * Thin logging wrapper around killswitch/authorizedUsers.ts's
    * manageAuthorizedUserCommand, which owns the actual root-admin gate +
    * candidate validation + DB mutation (and is unit-tested directly there,
@@ -312,9 +351,16 @@ async function main(): Promise<void> {
     applyAndPersist,
     sendStatusReport,
     sendHelp,
+    sendMenu,
     manageAuthorizedUser,
     telegramConfig,
     logger,
+  };
+
+  const buttonRouterDeps: ButtonRouterDeps = {
+    ...commandRouterDeps,
+    editMenuMessage,
+    answerCallback,
   };
 
   // Owner's own request ("мемпул", verbatim: once the process "comes back to
@@ -366,6 +412,20 @@ async function main(): Promise<void> {
           return;
         }
         routeAuthorizedCommand(result.command, result.args, result.chatId, commandRouterDeps);
+      },
+      undefined,
+      (cq) => {
+        if (!cq.auth.authorized) {
+          // Same RR-33 logging obligation as a typed command's rejection above.
+          logger.error({ rejectedChatId: cq.auth.rejectedChatId }, "REJECTED button tap from unauthorized chat_id");
+          // Still must clear the tapping user's loading spinner even though
+          // rejected — answerCallback needs telegramConfig, which this
+          // closure already has, so this bypasses buttonRouterDeps rather
+          // than routing an unauthorized tap through it.
+          void answerCallback(cq.callbackQueryId);
+          return;
+        }
+        routeCallbackQuery(cq.auth.command, cq.auth.chatId, cq.messageId, cq.callbackQueryId, buttonRouterDeps);
       },
     );
     logger.info("Telegram command polling started");

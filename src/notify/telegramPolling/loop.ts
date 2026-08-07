@@ -24,6 +24,22 @@ export interface TelegramPollingOptions {
   fetchTimeoutMs?: number;
 }
 
+/**
+ * A tapped inline-keyboard button, after the SAME authorizeCommand gate
+ * every typed command goes through — see updateParsing.ts's ParsedCallbackQuery
+ * and killswitch/buttonRouter.ts. `auth` reuses AuthorizedCommand's exact
+ * shape (callback_data is treated as a bare, slash-free "text" — authorizeCommand
+ * parses "stop" into `{command:"stop", args:[]}` the same way it would parse
+ * a typed "/stop"), so callers never need a second authorization code path.
+ * `callbackQueryId`/`messageId` are needed only for answerCallbackQuery/
+ * editMessageText, not for the authorization decision itself.
+ */
+export interface CallbackQueryDispatch {
+  auth: AuthorizedCommand;
+  callbackQueryId: string;
+  messageId: number;
+}
+
 export interface TelegramPollingHandle {
   /**
    * Resolves once the loop has actually exited — not merely once no further
@@ -73,6 +89,7 @@ export function startCommandPolling(
   isAuthorizedChat: ChatAuthorizer,
   onCommand: (result: AuthorizedCommand) => void,
   options?: TelegramPollingOptions,
+  onCallbackQuery?: (result: CallbackQueryDispatch) => void,
 ): TelegramPollingHandle {
   const timeoutSeconds = options?.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS;
   const errorBackoffMs = options?.errorBackoffMs ?? DEFAULT_ERROR_BACKOFF_MS;
@@ -178,7 +195,7 @@ export function startCommandPolling(
     let maxUpdateId: number | undefined;
 
     for (const rawUpdate of rawUpdates) {
-      const { updateId, command } = parseUpdate(rawUpdate);
+      const { updateId, command, callbackQuery } = parseUpdate(rawUpdate);
       if (updateId !== undefined && (maxUpdateId === undefined || updateId > maxUpdateId)) {
         maxUpdateId = updateId;
       }
@@ -191,6 +208,18 @@ export function startCommandPolling(
           onCommand(await authorizeCommand(isAuthorizedChat, command));
         } catch (e) {
           console.error("[telegram-polling] onCommand handler threw:", e instanceof Error ? e.message : e);
+        }
+      }
+      if (callbackQuery !== undefined && onCallbackQuery) {
+        // Same authorizeCommand gate as a typed command — callback_data is
+        // just "text" with no leading slash, which authorizeCommand parses
+        // into the identical {command, args} shape. Same try/catch guard as
+        // the onCommand branch above, for the same reason.
+        try {
+          const auth = await authorizeCommand(isAuthorizedChat, { chatId: callbackQuery.chatId, text: callbackQuery.data });
+          onCallbackQuery({ auth, callbackQueryId: callbackQuery.id, messageId: callbackQuery.messageId });
+        } catch (e) {
+          console.error("[telegram-polling] onCallbackQuery handler threw:", e instanceof Error ? e.message : e);
         }
       }
     }
