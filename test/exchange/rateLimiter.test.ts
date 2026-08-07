@@ -66,6 +66,23 @@ describe("RateLimiter", () => {
     await expect(p2).resolves.toBe("second call still runs");
   });
 
+  it("does not deadlock the queue when a scheduled fn throws synchronously before returning a promise", async () => {
+    const limiter = new RateLimiter(10);
+
+    const p1 = limiter.schedule((): never => {
+      throw new Error("sync guard failure");
+    });
+    // Attach the rejection assertion in the same tick p1 is created — otherwise
+    // Node flags it as an unhandled rejection during the gap before this runs.
+    const p1Assertion = expect(p1).rejects.toThrow("sync guard failure");
+    const p2 = limiter.schedule(async () => "second call still runs");
+
+    await vi.runAllTimersAsync();
+
+    await p1Assertion;
+    await expect(p2).resolves.toBe("second call still runs");
+  });
+
   it("propagates the resolved value of fn to the caller", async () => {
     const limiter = new RateLimiter(0);
     const result = await limiter.schedule(async () => 42);

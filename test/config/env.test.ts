@@ -118,3 +118,50 @@ describe("loadEnv — caching", () => {
     expect(env.APP_ENV).toBe("mainnet");
   });
 });
+
+// `cached = env;` sits after BOTH the zod safeParse and the two RR-05
+// mismatch checks (env.ts lines ~40-62) — so a throw from any of those must
+// leave `cached` unset, and a retry call (no resetEnvCacheForTests() in
+// between — that helper is a TEST-ONLY escape hatch, not something
+// production retry code can call) must re-validate from scratch rather than
+// serve a poisoned/stale value. RR-05 exists specifically to refuse a start
+// on a testnet/mainnet key mismatch — a future refactor that hoists
+// `cached = env;` above these checks (e.g. to share code with an early
+// return) would silently defeat that on exactly this retry path, and no
+// other test here would notice since every other "throws" test resets the
+// cache in afterEach without ever calling loadEnv() again first.
+describe("loadEnv — cache stays unset after a throw (no poisoning on retry)", () => {
+  it("RR-05 throw, then loadEnv() again with a corrected source in the SAME test (no reset): returns the corrected env, not a stale/poisoned one", () => {
+    expect(() => loadEnv(minimalTestnet({ BYBIT_MAINNET_API_KEY: "real-mainnet-key" }))).toThrow(
+      /mainnet keys leaking/,
+    );
+
+    // Deliberately no resetEnvCacheForTests() call here — this is the whole
+    // point of the test: if `cached` had been set before or during the throw,
+    // this call would wrongly return that (either the throwing env, somehow
+    // cached, or an earlier fixture) instead of re-parsing `source` below.
+    const env = loadEnv(minimalTestnet());
+    expect(env.APP_ENV).toBe("testnet");
+    expect(env.BYBIT_MAINNET_API_KEY).toBeUndefined();
+  });
+
+  it("invalid-schema throw, then loadEnv() again with a corrected source in the SAME test (no reset): returns the corrected env", () => {
+    const invalid = minimalTestnet();
+    delete invalid.DATABASE_URL;
+    expect(() => loadEnv(invalid)).toThrow(/DATABASE_URL/);
+
+    const env = loadEnv(minimalTestnet());
+    expect(env.DATABASE_URL).toBe("postgres://user:password@localhost:5432/trade_bot");
+  });
+
+  it("after a throw, normal caching semantics resume on the next successful call — first success still wins over a later different source", () => {
+    expect(() =>
+      loadEnv(minimalTestnet({ APP_ENV: "mainnet", BYBIT_TESTNET_API_KEY: "real-testnet-key" })),
+    ).toThrow(/testnet keys leaking/);
+
+    const first = loadEnv(minimalTestnet({ APP_ENV: "testnet" }));
+    const second = loadEnv(minimalTestnet({ APP_ENV: "mainnet" })); // ignored: already cached from `first`
+    expect(second).toBe(first);
+    expect(second.APP_ENV).toBe("testnet");
+  });
+});

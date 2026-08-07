@@ -210,6 +210,17 @@ function escapeHtml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/**
+ * Mirrors notify/formatDigest.ts's `escapeMdCell` choice and reasoning — see
+ * that file: a literal `|` in a value dropped into the Bot API 10.1 rich
+ * markdown string (formatStatusReportTable below) reads as a pipe-table cell
+ * boundary to Telegram's parser, so it is escaped here the same way, whether
+ * or not the value happens to land inside an actual `| ... |` table row.
+ */
+function escapeMdCell(text: string): string {
+  return text.replace(/\|/g, "\\|");
+}
+
 export function formatStatusReport(report: StatusReport): string {
   const lines: string[] = [];
 
@@ -268,7 +279,9 @@ export function formatStatusReportTable(report: StatusReport): string {
     `**Kill switch:** HALT_NEW ${report.haltNew ? "🛑 on" : "✅ off"}`,
     `FLATTEN_ALL ${report.flattenAll ? "🛑 on" : "✅ off"}`,
   ].join("  ·  ");
-  blocks.push(report.haltReason ? `${killSwitchLine}  ·  Причина: ${report.haltReason}` : killSwitchLine);
+  blocks.push(
+    report.haltReason ? `${killSwitchLine}  ·  Причина: ${escapeMdCell(report.haltReason)}` : killSwitchLine,
+  );
 
   blocks.push("**Данные (свежесть)**");
 

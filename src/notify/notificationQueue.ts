@@ -1,7 +1,10 @@
 import type { Kysely } from "kysely";
 import type { Database } from "../storage/schema.js";
+import { logger as rootLogger } from "../logger.js";
 import { sendAlert, sendRichMessage } from "./telegram.js";
 import type { SendAlertOptions, TelegramConfig } from "./telegram.js";
+
+const logger = rootLogger.child({ module: "notify:notificationQueue" });
 
 // `pending_telegram_messages.parse_mode` has no DB-level CHECK constraint
 // (migration comment: "'HTML' or NULL, mirrors SendAlertOptions.parseMode") —
@@ -76,6 +79,12 @@ export async function deliverPending(db: Kysely<Database>, config: TelegramConfi
   let stillFailing = 0;
 
   for (const message of pending) {
+    // Tracks which side of the send failed, so the catch block below can
+    // tell "Telegram rejected this message" (attempts/last_error IS the
+    // right record) apart from "Telegram already has it, only our own
+    // delivered_at bookkeeping failed" (attempts/last_error would be an
+    // actively misleading record of a working send as a broken one).
+    let sentToTelegram = false;
     try {
       if (message.parse_mode === RICH_MARKDOWN_MARKER) {
         await sendRichMessage(config, message.message_text);
@@ -86,6 +95,8 @@ export async function deliverPending(db: Kysely<Database>, config: TelegramConfi
             : undefined;
         await sendAlert(config, message.message_text, options);
       }
+      sentToTelegram = true;
+
       await db
         .updateTable("pending_telegram_messages")
         .set({ delivered_at: new Date() })
@@ -93,13 +104,44 @@ export async function deliverPending(db: Kysely<Database>, config: TelegramConfi
         .execute();
       delivered++;
     } catch (e) {
+      if (sentToTelegram) {
+        // The send itself succeeded; only marking delivered_at failed (e.g. a
+        // DB connection drop right after the Telegram call returned). This is
+        // NOT a send failure — do not run it through the attempts/last_error
+        // path below, which exists to describe Telegram rejecting a message.
+        // Known, accepted cost of not having a schema to spend on a "sent but
+        // unconfirmed" state (storage/schema.ts is out of scope here):
+        // delivered_at stays NULL, so the next deliverPending run resends this
+        // message. A duplicate Telegram message is the failure mode accepted
+        // here; silently losing the "it did go out" fact is not.
+        delivered++;
+        logger.error(
+          { messageId: message.id, err: e },
+          "sent to Telegram but failed to record delivered_at — message will be RESENT next cycle",
+        );
+        continue;
+      }
+
       stillFailing++;
       const errorMessage = e instanceof Error ? e.message : String(e);
-      await db
-        .updateTable("pending_telegram_messages")
-        .set({ attempts: message.attempts + 1, last_attempt_at: new Date(), last_error: errorMessage })
-        .where("id", "=", message.id)
-        .execute();
+      try {
+        await db
+          .updateTable("pending_telegram_messages")
+          .set({ attempts: message.attempts + 1, last_attempt_at: new Date(), last_error: errorMessage })
+          .where("id", "=", message.id)
+          .execute();
+      } catch (updateError) {
+        // Best-effort bookkeeping only: if the DB is unhealthy enough that
+        // even this UPDATE fails, this message's attempts/last_error simply
+        // don't advance this cycle. What must not happen is this exception
+        // escaping the loop — per this function's own contract above, one
+        // undeliverable message must never cost every message queued after
+        // it its own delivery attempt in this same call.
+        logger.error(
+          { messageId: message.id, err: updateError },
+          "failed to record a failed delivery attempt — continuing with the next queued message",
+        );
+      }
     }
   }
 

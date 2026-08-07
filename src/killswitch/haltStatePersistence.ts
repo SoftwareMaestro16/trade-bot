@@ -83,9 +83,24 @@ export async function loadHaltState(db: Kysely<HaltStateDatabase>): Promise<Halt
  *
  * Без ретраев и без обёртывающей транзакции — это одна атомарная операция БД,
  * большего сегодняшний scope не требует.
+ *
+ * Результат UPDATE проверяется по `numUpdatedRows`, а не отбрасывается
+ * (`.executeTakeFirst()`, не голый `.execute()`): миграция гарантирует строку
+ * id=1 при создании таблицы, но ничто в схеме не запрещает её ручной DELETE
+ * (только повторный INSERT блокируется CHECK id=1 + PK) — а `UPDATE ... WHERE
+ * id = 1` над отсутствующей строкой обновляет 0 строк и по умолчанию Postgres
+ * ЭТО НЕ ОШИБКА. Без этой проверки такой UPDATE молча "успевает" ничего не
+ * записав: killswitch-listener.ts's applyAndPersist увидел бы обычный resolve
+ * и залогировал/разослал в Telegram "persisted", пока реальное HALT_NEW/
+ * FLATTEN_ALL состояние ни разу не попало в БД — именно в момент экстренной
+ * остановки, когда RR-52's "переживает рестарт" важнее всего. Бросок здесь (а
+ * не деньги-подобный fail-open) fail-closed: applyAndPersist уже ловит любое
+ * исключение из saveHaltState и алертит "PERSIST FAILED" вместо ложного
+ * "persisted" (см. его собственный doc comment) — тот путь уже правильный,
+ * ему просто не хватало этого исключения, чтобы сработать.
  */
 export async function saveHaltState(db: Kysely<HaltStateDatabase>, state: HaltState): Promise<void> {
-  await db
+  const result = await db
     .updateTable("halt_state")
     .set({
       halt_new: state.haltNew,
@@ -96,5 +111,11 @@ export async function saveHaltState(db: Kysely<HaltStateDatabase>, state: HaltSt
       updated_at: new Date(),
     })
     .where("id", "=", HALT_STATE_ROW_ID)
-    .execute();
+    .executeTakeFirst();
+
+  if (result.numUpdatedRows !== 1n) {
+    throw new Error(
+      `saveHaltState: UPDATE halt_state WHERE id = ${HALT_STATE_ROW_ID} affected ${result.numUpdatedRows.toString()} row(s), expected exactly 1 — the halt_state singleton row is missing (or duplicated). The halt state was NOT durably persisted; failing loud instead of silently reporting success (RISK-REGISTER.md FM-34 / RR-52).`,
+    );
+  }
 }

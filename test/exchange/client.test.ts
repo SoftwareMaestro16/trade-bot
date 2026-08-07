@@ -1,5 +1,5 @@
 import nock from "nock";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { BybitError } from "../../src/exchange/errors.js";
 import { PublicExchangeClient } from "../../src/exchange/client.js";
 
@@ -17,6 +17,34 @@ describe("PublicExchangeClient", () => {
       .reply(200, { retCode: 110001, retMsg: "Order does not exist", result: {}, time: Date.now() });
 
     const client = new PublicExchangeClient({ testnet: true });
+
+    await expect(
+      client.getInstrumentsInfo({ category: "linear" }),
+    ).rejects.toMatchObject({ kind: "retcode", retCode: 110001 });
+  });
+
+  it("rejects when raw.<method> itself resolves (rather than throws) with a non-zero retCode — client.ts's own RR-51 recheck at lines 43-48, not bybit-api's throwExceptions path", async () => {
+    // The test above goes through nock, i.e. a real HTTP round-trip, which
+    // bybit-api's BaseRestClient turns into a *throw* itself before call()'s
+    // `await fn()` ever gets a chance to resolve (throwExceptions:true —
+    // confirmed at node_modules/bybit-api/lib/util/BaseRestClient.js:198,
+    // `if (this.options.throwExceptions && result.retCode !== 0) throw result;`).
+    // So that test only ever exercises normalizeBybitError's isHasRetCode
+    // branch, never client.ts's own manual `result.retCode !== 0` recheck.
+    //
+    // Here raw.getInstrumentsInfo is mocked to *resolve* with a failing
+    // retCode instead — the exact shape it would take if a future bybit-api
+    // release silently changed throwExceptions' behavior. This is the one
+    // path that actually reaches (and would catch a regression in) client.ts
+    // lines 43-48 themselves.
+    const client = new PublicExchangeClient({ testnet: true });
+    vi.spyOn(client["raw"], "getInstrumentsInfo").mockResolvedValue({
+      retCode: 110001,
+      retMsg: "Order does not exist",
+      result: { category: "linear", list: [] },
+      retExtInfo: {},
+      time: Date.now(),
+    });
 
     await expect(
       client.getInstrumentsInfo({ category: "linear" }),

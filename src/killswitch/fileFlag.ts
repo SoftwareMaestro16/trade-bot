@@ -61,6 +61,18 @@ const DEFAULT_POLL_INTERVAL_MS = 2000;
  * здесь: это критический путь безопасности, и watcher не должен переставать
  * видеть флаг на будущих тиках только потому, что вышестоящий обработчик упал
  * на одном конкретном вызове.
+ *
+ * `onFlagDetected` типизирован как `() => void`, но TypeScript допускает
+ * присвоение сюда `() => Promise<void>` (void-return assignability) без
+ * ошибки компиляции. try/catch вокруг синхронного вызова ловит только
+ * СИНХРОННЫЙ throw — если такой асинхронный колбэк отклонит промис уже
+ * после первого await, это произойдёт вне try/catch и станет unhandled
+ * promise rejection, который крашит именно тот процесс, чья единственная
+ * задача — пережить и поймать сигнал останова (killswitch-listener). Ниже
+ * поэтому дополнительно проверяется, не является ли результат вызова
+ * thenable, и если да — навешивается обработчик отклонения ДО того, как
+ * управление вернётся из этого тика (до какого-либо await), чтобы Node
+ * успел увидеть обработчик и не считал промис unhandled.
  */
 /**
  * `wasPresentAtStart` reports whether the flag was ALREADY on disk at the
@@ -91,7 +103,27 @@ export function startFileFlagWatcher(
     const isPresent = isFlagPresent(flagFilePath);
     if (isPresent && !wasPresent) {
       try {
-        onFlagDetected();
+        const result: unknown = onFlagDetected();
+        // Defensive runtime check for the case the type signature doesn't
+        // prevent at compile time (see doc comment above): onFlagDetected
+        // may actually be an async function whose returned promise rejects
+        // after its first await, past the point this try/catch can see it.
+        // Attached synchronously, in the same tick as the call above and
+        // before any await here — a handler attached this early is what
+        // keeps Node from ever considering the promise unhandled, no matter
+        // when it later settles.
+        if (
+          result !== null &&
+          (typeof result === "object" || typeof result === "function") &&
+          typeof (result as { then?: unknown }).then === "function"
+        ) {
+          (result as PromiseLike<unknown>).then(undefined, (e: unknown) => {
+            console.error(
+              `[killswitch:fileFlag] onFlagDetected's returned promise rejected for ${flagFilePath} — watcher continues:`,
+              e,
+            );
+          });
+        }
       } catch (e) {
         console.error(`[killswitch:fileFlag] onFlagDetected threw for ${flagFilePath} — watcher continues:`, e);
       }

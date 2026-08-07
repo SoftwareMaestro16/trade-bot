@@ -100,4 +100,36 @@ describe("scheduleDailyAt", () => {
     await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
     expect(callCount).toBe(1); // unchanged after stop
   });
+
+  it("stop() waits for an in-flight fn() call to finish before resolving", async () => {
+    let resolveFn!: () => void;
+    const fnGate = new Promise<void>((resolve) => {
+      resolveFn = resolve;
+    });
+    let fnStarted = false;
+    vi.setSystemTime(new Date("2026-08-06T08:59:00Z"));
+
+    const task = scheduleDailyAt([9], 0, async () => {
+      fnStarted = true; // set BEFORE awaiting the gate, so the test can detect "fn is genuinely in flight"
+      await fnGate;
+    });
+
+    await vi.advanceTimersByTimeAsync(60 * 1000); // reaches 09:00 -> fn() starts and hangs on fnGate
+    expect(fnStarted).toBe(true);
+
+    let stopResolved = false;
+    const stopPromise = task.stop().then(() => {
+      stopResolved = true;
+    });
+
+    // Flush pending microtasks without advancing real firing time: if stop()
+    // resolved without actually waiting for the in-flight fn(), stopResolved
+    // would already be true here.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stopResolved).toBe(false); // fn() is still hanging on fnGate
+
+    resolveFn();
+    await stopPromise;
+    expect(stopResolved).toBe(true);
+  });
 });

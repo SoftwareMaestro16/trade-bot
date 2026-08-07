@@ -80,6 +80,18 @@ describe("formatDigestMessage", () => {
     expect(message).toContain("0");
     expect(message).not.toContain("Последний цикл");
   });
+
+  it("shows ±0 when the count is unchanged from the previous digest", () => {
+    const message = formatDigestMessage(baseStats({ tickersWritten: 1401 }), baseStats({ tickersWritten: 1401 }));
+    expect(message).toContain("1401 (±0)");
+  });
+
+  it("shows a negative delta with a single leading minus when a count drops", () => {
+    const message = formatDigestMessage(baseStats({ tickersWritten: 1000 }), baseStats({ tickersWritten: 1200 }));
+    expect(message).toContain("1000 (-200)");
+    expect(message).not.toContain("(--200)");
+    expect(message).not.toContain("(+-200)");
+  });
 });
 
 describe("formatDigestTable (Bot API 10.1 sendRichMessage markdown)", () => {
@@ -122,5 +134,26 @@ describe("formatDigestTable (Bot API 10.1 sendRichMessage markdown)", () => {
     const table = formatDigestTable(baseStats());
     const tableBlockStart = table.indexOf("| Таблица");
     expect(table.slice(tableBlockStart - 2, tableBlockStart)).toBe("\n\n");
+  });
+
+  it("shows ±0 in the delta cell when the count is unchanged from the previous digest", () => {
+    const table = formatDigestTable(baseStats({ tickersWritten: 1401 }), baseStats({ tickersWritten: 1401 }));
+    expect(table).toContain("| tickers | 1401 | (±0) |");
+  });
+
+  it("shows a negative delta with a single leading minus when a count drops", () => {
+    const table = formatDigestTable(baseStats({ tickersWritten: 1000 }), baseStats({ tickersWritten: 1200 }));
+    expect(table).toContain("| tickers | 1000 | (-200) |");
+    expect(table).not.toContain("(--200)");
+  });
+
+  it("omits the 'Последний цикл' line when lastRunAt is null", () => {
+    const table = formatDigestTable(baseStats({ lastRunAt: null }));
+    expect(table).not.toContain("Последний цикл");
+  });
+
+  it("omits the failures section entirely when there are none", () => {
+    const table = formatDigestTable(baseStats({ recentFailures: [] }));
+    expect(table).not.toContain("Ошибки");
   });
 });

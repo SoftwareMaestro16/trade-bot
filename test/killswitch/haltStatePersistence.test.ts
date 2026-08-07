@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { Kysely, PostgresDialect } from "kysely";
+import { Kysely, NoResultError, PostgresDialect } from "kysely";
 import pg from "pg";
 import { applyFlattenAll, applyHaltNew, CLEARED_STATE } from "../../src/killswitch/haltState.js";
 import type { HaltState } from "../../src/killswitch/haltState.js";
@@ -80,5 +80,49 @@ describe("killswitch/haltStatePersistence (RISK-REGISTER.md FM-34, against a rea
     expect(loaded.reason).toBeNull();
     expect(loaded.setBy).toBeNull();
     expect(loaded).toEqual(state);
+  });
+
+  it("loadHaltState throws instead of silently returning CLEARED_STATE-shaped data when the singleton row is missing", async () => {
+    // Runtime code never deletes the row (see this module's doc comment) — the delete
+    // below only ever happens inside a transaction that this test rolls back (by
+    // rethrowing), so the shared singleton row every other test in this file depends on
+    // is guaranteed to still exist afterwards, whether the assertion passes or not.
+    await expect(
+      db.transaction().execute(async (trx) => {
+        await trx.deleteFrom("halt_state").where("id", "=", 1).execute();
+        await loadHaltState(trx);
+      }),
+    ).rejects.toBeInstanceOf(NoResultError);
+
+    // Confirms the transaction really rolled back and didn't leave the table empty for
+    // whatever runs next — not a general Postgres-transaction sanity check.
+    const state = await loadHaltState(db);
+    expect(state).toEqual(CLEARED_STATE);
+  });
+
+  it("saveHaltState throws instead of silently no-op'ing when the singleton row is missing (UPDATE affects 0 rows)", async () => {
+    // Nothing in the schema prevents a manual DELETE of the singleton row (only a
+    // duplicate INSERT is blocked, by CHECK id=1 + PK) — an `UPDATE ... WHERE id = 1`
+    // against that missing row is valid SQL that affects 0 rows and, by itself,
+    // resolves successfully. Without saveHaltState checking numUpdatedRows, this would
+    // silently discard the halt command instead of persisting it: exactly the scenario
+    // that defeats RR-52's crash-survival guarantee at an emergency stop. Same
+    // rollback-via-rethrow pattern as the loadHaltState test above — the delete below
+    // only ever happens inside a transaction this test rolls back, so the shared
+    // singleton row every other test in this file depends on still exists afterwards.
+    await expect(
+      db.transaction().execute(async (trx) => {
+        await trx.deleteFrom("halt_state").where("id", "=", 1).execute();
+        const halted = applyHaltNew(CLEARED_STATE, "manual pause", "manual", Date.now());
+        await saveHaltState(trx, halted);
+      }),
+    ).rejects.toThrow(/affected 0 row/);
+
+    // Confirms the transaction really rolled back and didn't leave the table empty for
+    // whatever runs next, AND that the failed saveHaltState above didn't somehow leave
+    // stale data behind — the row here must be exactly the untouched CLEARED_STATE the
+    // migration produced, not the "halted" state the throwing call attempted to write.
+    const state = await loadHaltState(db);
+    expect(state).toEqual(CLEARED_STATE);
   });
 });
