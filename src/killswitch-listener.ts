@@ -13,9 +13,12 @@ import { isAuthorizedChat, manageAuthorizedUserCommand } from "./killswitch/auth
 import { logger as rootLogger } from "./logger.js";
 import { sendAlert, sendRichMessage } from "./notify/telegram.js";
 import type { TelegramConfig } from "./notify/telegram.js";
+import { deliverPending, enqueueNotification } from "./notify/notificationQueue.js";
 import { startCommandPolling } from "./notify/telegramPolling.js";
 import type { TelegramPollingHandle } from "./notify/telegramPolling.js";
 import { computeStatusReport, formatStatusReportTable } from "./notify/statusReport.js";
+import { scheduleRepeating } from "./scheduleRepeating.js";
+import type { ScheduledTask } from "./scheduleRepeating.js";
 import type { Database } from "./storage/schema.js";
 
 const logger = rootLogger.child({ module: "killswitch-listener" });
@@ -38,6 +41,11 @@ const logger = rootLogger.child({ module: "killswitch-listener" });
  */
 
 const DEFAULT_FLAG_FILENAME = "KILLSWITCH_STOP";
+
+// Same cadence as collector.ts's own NOTIFICATION_RETRY_INTERVAL_MS — no
+// reason for these two independent processes' retry loops to disagree, and
+// keeping them equal is one less thing to explain if someone reads both.
+const NOTIFICATION_RETRY_INTERVAL_MS = 15 * 60_000;
 
 async function main(): Promise<void> {
   const env = loadEnv();
@@ -117,33 +125,65 @@ async function main(): Promise<void> {
   // inFlightPersists.track() is that missing handle; shutdown() drains it below.
   const inFlightPersists = createInFlightTracker();
 
+  /**
+   * Owner's own request ("мемпул" — a message that fails to send must not
+   * just vanish, and once the process "comes back to itself" it sends what
+   * it should have sent): routes every halt/resume alert through
+   * notify/notificationQueue.ts's durable queue (already built and already
+   * used by collector.ts's digest — see that module's own doc comment
+   * explicitly naming "killswitch-listener.ts's alerts" as an intended
+   * consumer that, until now, never actually used it) instead of a bare
+   * `sendAlert` with nothing behind it if Telegram is unreachable.
+   *
+   * `enqueueNotification` writes to the SAME Postgres connection this
+   * function's own caller just used (or is using) for `saveHaltState` — if
+   * that DB write is healthy enough to enqueue, it's durable across a crash
+   * or restart from this instant on, `deliverPending` below then attempts
+   * immediate delivery (so a healthy Telegram still gets the alert right
+   * away, not just on the next retry tick), and if delivery fails only the
+   * *first* attempt, main()'s startup flush and periodic retry (below) pick
+   * it up later. Falls back to a direct, best-effort `sendAlert` ONLY if
+   * `enqueueNotification` itself throws — i.e. the DB is unhealthy enough
+   * that even a single INSERT fails, which for the persist-failure branch
+   * below is actually the common case (it's already in a "the DB write we
+   * just tried failed" state) and queuing would just fail the same way.
+   */
+  async function alertDurably(text: string): Promise<void> {
+    if (!telegramConfig) return;
+    try {
+      // statusDb, not db: `db` is narrowly typed Kysely<HaltStateDatabase>
+      // (halt_state only, see haltStatePersistence.ts) — pending_telegram_messages
+      // isn't in that type at all. statusDb is the full Kysely<Database> on
+      // the SAME underlying pg.Pool (see its own definition above), so this
+      // doesn't open a second connection or change what "the DB" means here.
+      await enqueueNotification(statusDb, text, { parseMode: "HTML" });
+      await deliverPending(statusDb, telegramConfig);
+    } catch (e) {
+      logger.error({ err: e }, "failed to queue alert (DB likely unhealthy) — attempting a direct send instead");
+      try {
+        await sendAlert(telegramConfig, text, { parseMode: "HTML" });
+      } catch (sendError) {
+        logger.error({ err: sendError }, "...and the direct fallback send also failed");
+      }
+    }
+  }
+
   async function applyAndPersist(next: HaltState, logLine: string): Promise<void> {
     state = next;
     try {
       await enqueuePersist(() => saveHaltState(db, next));
     } catch (e) {
       logger.error({ err: e, logLine }, "FAILED TO PERSIST (state is still applied in-memory)");
-      if (telegramConfig) {
-        try {
-          await sendAlert(
-            telegramConfig,
-            `⚠️ <b>PERSIST FAILED</b> — ${logLine}\nThis process still behaves accordingly, but the DB write failed — a restart before this is fixed will lose it. Investigate the database.`,
-            { parseMode: "HTML" },
-          );
-        } catch (alertError) {
-          logger.error({ err: alertError }, "...and the failure alert itself also failed to send");
-        }
-      }
+      // alertDurably never throws and already no-ops when Telegram isn't
+      // configured — no wrapping try/catch or `if (telegramConfig)` needed
+      // here, unlike the old direct-sendAlert call this replaced.
+      await alertDurably(
+        `⚠️ <b>PERSIST FAILED</b> — ${logLine}\nThis process still behaves accordingly, but the DB write failed — a restart before this is fixed will lose it. Investigate the database.`,
+      );
       return;
     }
     logger.info(logLine);
-    if (telegramConfig) {
-      try {
-        await sendAlert(telegramConfig, logLine, { parseMode: "HTML" });
-      } catch (e) {
-        logger.error({ err: e }, "state change persisted, but the Telegram alert failed to send");
-      }
-    }
+    await alertDurably(logLine);
   }
 
   // FM-34 / fileFlag.ts's own documented boundary: a flag already present at
@@ -317,6 +357,37 @@ async function main(): Promise<void> {
     }
   }
 
+  // Owner's own request ("мемпул", verbatim: once the process "comes back to
+  // itself" it should send what it should have sent) — mirrors collector.ts's
+  // own startup-flush-then-periodic-retry pattern for the exact same durable
+  // queue (notify/notificationQueue.ts). Tracked (not a dangling promise/
+  // fire-and-forget task) so shutdown() below can wait for both before
+  // db.destroy() runs, same discipline as every other in-flight write this
+  // file already protects.
+  let startupQueueFlush: Promise<void> = Promise.resolve();
+  let notificationRetryTask: ScheduledTask | null = null;
+  if (telegramConfig) {
+    const flushConfig = telegramConfig;
+    startupQueueFlush = deliverPending(statusDb, flushConfig)
+      .then((r) => {
+        if (r.delivered > 0 || r.stillFailing > 0) {
+          logger.info({ delivered: r.delivered, stillFailing: r.stillFailing }, "flushed pending Telegram queue");
+        }
+      })
+      .catch((e: unknown) => logger.error({ err: e }, "pending Telegram queue flush failed"));
+
+    notificationRetryTask = scheduleRepeating(
+      "notification-queue-retry",
+      async () => {
+        const r = await deliverPending(statusDb, flushConfig);
+        if (r.delivered > 0) {
+          logger.info({ delivered: r.delivered, stillFailing: r.stillFailing }, "delivered");
+        }
+      },
+      NOTIFICATION_RETRY_INTERVAL_MS,
+    );
+  }
+
   let telegramPolling: TelegramPollingHandle | null = null;
   if (telegramConfig) {
     // Captured as its own const (rather than reading telegramConfig.allowedChatId
@@ -381,6 +452,14 @@ async function main(): Promise<void> {
       // AbortController timeout, so this can't hang forever on a black-holed
       // connection.
       await telegramPolling?.stop();
+      // Same reasoning as telegramPolling.stop() above, for the notification
+      // queue's own periodic retry task — stop it BEFORE inFlightPersists.drain()
+      // so no new deliverPending cycle can start after this point, and so any
+      // cycle already in flight finishes (ScheduledTask.stop's own contract)
+      // before db.destroy() runs. Also await the startup flush itself: in the
+      // (rare) case shutdown() fires very early, before that flush finished.
+      await notificationRetryTask?.stop();
+      await startupQueueFlush;
       // Drains every applyAndPersist call still in flight — fed by both the
       // file-flag path (whose watcher was already stopped above, so no new
       // one can start after this point) and the Telegram path (same, via
