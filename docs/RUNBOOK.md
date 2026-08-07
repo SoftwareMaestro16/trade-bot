@@ -141,6 +141,29 @@ sudo systemctl enable --now trade-bot-collector
 
 ### Обновление кода на живом сервере
 
+**По факту (2026-08-07): `/opt/trade-bot` на VPS — не git-чекаут** (`.git` там нет). Код доставляется tar-синком с локальной машины, обычно по SSH под `root`:
+
+```bash
+# с локальной машины
+tar czf - --exclude=node_modules --exclude=.git --exclude=dist . | \
+  ssh -i .deploy-keys/trade_bot_vps root@<VPS_IP> "tar xzf - -C /opt/trade-bot"
+
+# на VPS
+cd /opt/trade-bot
+npm ci
+npm run build
+npm run migrate:up                # если есть новые миграции — см. раздел 5
+chown tradebot:tradebot /opt/trade-bot   # ОБЯЗАТЕЛЬНО, см. ниже
+sudo systemctl restart trade-bot-collector
+sudo systemctl restart trade-bot-killswitch-listener
+```
+
+**Почему `chown` обязателен, не опционален**: `tar` на Windows/Git-Bash не имеет реального UID/GID-маппинга, поэтому `root`, распаковывая архив, создаёт верхнеуровневый каталог `/opt/trade-bot` с сырыми числовыми владельцами локальной машины — НЕ `tradebot`, от чьего имени реально работают оба systemd-юнита (`User=tradebot`). `dist/`/`node_modules/` при этом получаются верно (`npm ci`/`npm run build` выполняются уже от `tradebot` или пересоздают эти каталоги), но сам верхний каталог — нет. Это не гипотетический риск: инцидент 2026-08-07 (см. PHASE-LOG.md) — `killswitch-listener`'s собственный стартовый self-test (`killswitch/fileFlag.ts`) не смог создать `KILLSWITCH_STOP` в `/opt/trade-bot` из-за `EACCES`, корректно отказался стартовать (fail-closed), и после исчерпания `StartLimitBurst=5` кильсвич уровня 1 пролежал недоступным **4 часа 43 минуты**, пока не был обнаружен вручную. `trade-bot-collector` не пострадал только потому, что не пишет новых файлов в верхний уровень каталога — это везение, не гарантия.
+
+Если/когда появится приватный git remote, план — переключиться на `git clone`/`git pull` (см. ниже), что снимает эту проблему полностью: `git pull`, выполненный от `tradebot`, никогда не тронет владельца каталога. До этого момента `chown` — обязательный последний шаг любого tar-синк-деплоя, не «на будущее».
+
+**Целевой процесс (когда появится приватный remote):**
+
 ```bash
 cd /opt/trade-bot
 git pull
@@ -148,6 +171,7 @@ npm ci
 npm run build
 npm run migrate:up                # если есть новые миграции — см. раздел 5
 sudo systemctl restart trade-bot-collector
+sudo systemctl restart trade-bot-killswitch-listener
 ```
 
 **На Фазе 1 это безопасно в любой момент** — процесс не держит открытых позиций, рестарт максимум обрывает один цикл сбора (что попадёт в `collection_runs` как явный gap, FR-109). Это же не будет верно для `trader`-процесса в Фазах 4+ — там подряд рестарт с открытой позицией требует отдельной процедуры (SRS FR-306, ARCHITECTURE.md §4 `RECOVERY`), которая ещё не написана и будет отдельным разделом этого документа, когда появится код.
