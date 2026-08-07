@@ -15,6 +15,7 @@ import type { UniverseSymbol } from "./market-data/universe.js";
 import { scheduleDailyAt } from "./notify/dailySchedule.js";
 import { formatDigestTable } from "./notify/formatDigest.js";
 import { startHeartbeat } from "./notify/healthcheck.js";
+import type { FreshnessCheck } from "./notify/healthcheck.js";
 import { deliverPending, enqueueRichNotification } from "./notify/notificationQueue.js";
 import { scheduleRepeating, type ScheduledTask } from "./scheduleRepeating.js";
 import { createDb } from "./storage/db.js";
@@ -70,14 +71,23 @@ const DIGEST_MINUTE_UTC = 0;
 // silently failing (e.g. a dead DB connection) no longer looks healthy.
 const HEARTBEAT_INTERVAL_MS = 5 * 60_000;
 
-// How stale the newest `tickers` row is allowed to be before the heartbeat
-// treats the collector as unhealthy and withholds its ping (letting
-// healthchecks.io's own "ping didn't arrive" alert fire). TICKER_INTERVAL_MS
-// is 60s, so 10 minutes tolerates ~10 consecutive missed cycles — generous
-// enough that a single transient Bybit hiccup never false-alarms, tight
-// enough that "running but writing nothing" is caught within one HEARTBEAT
-// window either way.
+// How stale the newest `tickers`/`orderbook_levels` row is allowed to be
+// before the heartbeat treats that stream as unhealthy and withholds its
+// ping (letting healthchecks.io's own "ping didn't arrive" alert fire).
+// Both run every 60s (TICKER_INTERVAL_MS/ORDERBOOK_INTERVAL_MS), so 10
+// minutes tolerates ~10 consecutive missed cycles — generous enough that a
+// single transient Bybit hiccup never false-alarms, tight enough that
+// "running but writing nothing" is caught within one HEARTBEAT window
+// either way.
 const DB_STALE_AFTER_MS = 10 * 60_000;
+
+// Same reasoning as DB_STALE_AFTER_MS, but for the two collectors that run
+// every 5 minutes (LONG_SHORT_INTERVAL_MS/SETTLED_FUNDING_INTERVAL_MS) —
+// 20 minutes tolerates ~4 consecutive missed cycles, keeping the same
+// "generous but not blind" ratio (~10x the real interval) as the 60s streams
+// above, rather than reusing DB_STALE_AFTER_MS unchanged and effectively
+// tightening their tolerance to only ~2 missed cycles.
+const SLOW_STREAM_STALE_AFTER_MS = 20 * 60_000;
 
 // notificationQueue.ts's own retry cadence for anything still sitting
 // undelivered (Telegram was down, network blip, etc.) — independent of the
@@ -310,14 +320,54 @@ async function main(): Promise<void> {
 
   // Optional: only wired up if HEALTHCHECK_PING_URL is set (.env.example).
   // See notify/healthcheck.ts's own doc comment for why this is a genuinely
-  // separate channel from the Telegram digest above, not a duplicate of it.
+  // separate channel from the Telegram digest above, not a duplicate of it,
+  // and for why these four checks (not six, not one) are exactly the
+  // independently-scheduled write paths worth gating the ping on.
   if (env.HEALTHCHECK_PING_URL) {
-    tasks.push(startHeartbeat(env.HEALTHCHECK_PING_URL, HEARTBEAT_INTERVAL_MS, db, DB_STALE_AFTER_MS));
+    const freshnessChecks: FreshnessCheck[] = [
+      {
+        label: "tickers",
+        staleAfterMs: DB_STALE_AFTER_MS,
+        latestAt: async (checkDb) => {
+          const row = await checkDb.selectFrom("tickers").select(({ fn }) => fn.max("fetched_at").as("latest")).executeTakeFirst();
+          return row?.latest ?? null;
+        },
+      },
+      {
+        label: "orderbook_levels",
+        staleAfterMs: DB_STALE_AFTER_MS,
+        latestAt: async (checkDb) => {
+          const row = await checkDb.selectFrom("orderbook_levels").select(({ fn }) => fn.max("fetched_at").as("latest")).executeTakeFirst();
+          return row?.latest ?? null;
+        },
+      },
+      {
+        label: "long_short_ratio",
+        staleAfterMs: SLOW_STREAM_STALE_AFTER_MS,
+        latestAt: async (checkDb) => {
+          const row = await checkDb.selectFrom("long_short_ratio").select(({ fn }) => fn.max("fetched_at").as("latest")).executeTakeFirst();
+          return row?.latest ?? null;
+        },
+      },
+      {
+        label: "funding_rates(settled)",
+        staleAfterMs: SLOW_STREAM_STALE_AFTER_MS,
+        latestAt: async (checkDb) => {
+          const row = await checkDb
+            .selectFrom("funding_rates")
+            .select(({ fn }) => fn.max("fetched_at").as("latest"))
+            .where("kind", "=", "settled")
+            .executeTakeFirst();
+          return row?.latest ?? null;
+        },
+      },
+    ];
+    tasks.push(startHeartbeat(env.HEALTHCHECK_PING_URL, HEARTBEAT_INTERVAL_MS, db, freshnessChecks));
     logger.info(
       {
         task: "startup",
         heartbeatIntervalMin: HEARTBEAT_INTERVAL_MS / 60_000,
-        dbStaleAfterMin: DB_STALE_AFTER_MS / 60_000,
+        checks: freshnessChecks.map((c) => c.label),
       },
       "external heartbeat enabled",
     );

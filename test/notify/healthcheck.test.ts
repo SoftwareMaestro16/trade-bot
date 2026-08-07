@@ -3,6 +3,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { Kysely, PostgresDialect } from "kysely";
 import pg from "pg";
 import { startHeartbeat } from "../../src/notify/healthcheck.js";
+import type { FreshnessCheck } from "../../src/notify/healthcheck.js";
 import { createDb } from "../../src/storage/db.js";
 import type { Database } from "../../src/storage/schema.js";
 
@@ -12,10 +13,10 @@ const STALE_AFTER_MS = 60_000;
 
 // A pool pointed at a port nothing listens on: any real query against it
 // rejects (connection refused) — same pattern as
-// killswitch/authorizedUsers.test.ts's brokenDb(), used below to exercise
-// isDataFresh's catch branch (a genuine query failure — "DB down, connection
-// dropped" per its doc comment) without waiting out a real network timeout
-// against an unreachable host.
+// killswitch/authorizedUsers.test.ts's brokenDb(), used below to exercise a
+// check's catch branch (a genuine query failure — "DB down, connection
+// dropped") without waiting out a real network timeout against an
+// unreachable host.
 function brokenDb(): Kysely<Database> {
   const pool = new pg.Pool({ connectionString: "postgresql://nouser:nopass@127.0.0.1:1/nonexistent" });
   pool.on("error", () => {
@@ -51,7 +52,24 @@ describe("startHeartbeat (against a real local Postgres, mocked ping endpoint)",
       .execute();
   }
 
-  it("pings immediately on start when tickers data is fresh, then again after each interval", async () => {
+  /** Single-check array mirroring this file's old tickers-only behavior, for tests that don't care about the multi-check case specifically. */
+  function tickersOnlyCheck(staleAfterMs = STALE_AFTER_MS): FreshnessCheck[] {
+    return [
+      {
+        label: "tickers",
+        staleAfterMs,
+        latestAt: async (checkDb) => {
+          const row = await checkDb
+            .selectFrom("tickers")
+            .select(({ fn }) => fn.max("fetched_at").as("latest"))
+            .executeTakeFirst();
+          return row?.latest ?? null;
+        },
+      },
+    ];
+  }
+
+  it("pings immediately on start when the check's data is fresh, then again after each interval", async () => {
     await insertTicker(new Date());
     let hits = 0;
     nock(BASE).get(PING_PATH).query(true).times(3).reply(() => {
@@ -59,42 +77,42 @@ describe("startHeartbeat (against a real local Postgres, mocked ping endpoint)",
       return [200, "OK"];
     });
 
-    const handle = startHeartbeat(`${BASE}${PING_PATH}`, 50, db, STALE_AFTER_MS);
+    const handle = startHeartbeat(`${BASE}${PING_PATH}`, 50, db, tickersOnlyCheck());
 
     await vi.waitFor(() => expect(hits).toBeGreaterThanOrEqual(3));
     await handle.stop();
   });
 
-  it("withholds the ping (and logs) when the newest tickers row is older than staleAfterMs", async () => {
+  it("withholds the ping (and logs) when the newest row is older than staleAfterMs", async () => {
     await insertTicker(new Date(Date.now() - STALE_AFTER_MS - 60_000));
     const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     // No nock interceptor registered — if the heartbeat tried to ping anyway,
     // this would fail with a real "no match" error from nock, not silently pass.
 
-    const handle = startHeartbeat(`${BASE}${PING_PATH}`, 30, db, STALE_AFTER_MS);
+    const handle = startHeartbeat(`${BASE}${PING_PATH}`, 30, db, tickersOnlyCheck());
 
     await vi.waitFor(() => {
-      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("stale beyond"));
+      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("tickers stale beyond"));
     });
 
     await handle.stop();
     consoleErrorSpy.mockRestore();
   });
 
-  it("withholds the ping when tickers has no rows at all", async () => {
+  it("withholds the ping when there are no rows at all", async () => {
     const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
-    const handle = startHeartbeat(`${BASE}${PING_PATH}`, 30, db, STALE_AFTER_MS);
+    const handle = startHeartbeat(`${BASE}${PING_PATH}`, 30, db, tickersOnlyCheck());
 
     await vi.waitFor(() => {
-      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("stale beyond"));
+      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("tickers stale beyond"));
     });
 
     await handle.stop();
     consoleErrorSpy.mockRestore();
   });
 
-  it("withholds the ping (fails closed) when the freshness query itself fails — not merely 'no fresh rows'", async () => {
+  it("withholds the ping (fails closed) when a check's own query fails — not merely 'no fresh rows'", async () => {
     // Insert a fresh row via the REAL db first, to prove this test is
     // exercising the query-failure catch branch specifically, not merely
     // falling through the already-covered "no fresh row"/"stale row" paths:
@@ -103,21 +121,21 @@ describe("startHeartbeat (against a real local Postgres, mocked ping endpoint)",
     await insertTicker(new Date());
     const broken = brokenDb();
     const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    // No nock interceptor registered — if isDataFresh failed OPEN instead of
+    // No nock interceptor registered — if the check failed OPEN instead of
     // closed, the heartbeat would attempt a real ping and nock would reject
     // it with a "no match registered" error, which would surface as an
     // unexpected "[heartbeat] ping failed:" log instead of the assertions
     // below ever matching — so a regression here fails loudly, not silently.
 
     try {
-      const handle = startHeartbeat(`${BASE}${PING_PATH}`, 30, broken, STALE_AFTER_MS);
+      const handle = startHeartbeat(`${BASE}${PING_PATH}`, 30, broken, tickersOnlyCheck());
 
       await vi.waitFor(() => {
-        expect(consoleErrorSpy).toHaveBeenCalledWith("[heartbeat] DB freshness check failed:", expect.any(String));
+        expect(consoleErrorSpy).toHaveBeenCalledWith(
+          "[heartbeat] tickers freshness query failed:",
+          expect.any(String),
+        );
       });
-      // isDataFresh's catch returns false same as genuine staleness, so the
-      // caller (tick()) withholds the ping the same way it would for stale data.
-      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("stale beyond"));
 
       await handle.stop();
     } finally {
@@ -126,13 +144,61 @@ describe("startHeartbeat (against a real local Postgres, mocked ping endpoint)",
     }
   });
 
+  it("withholds the ping when only ONE of several checks is stale, even though the rest are fresh — a single broken collector must not look healthy", async () => {
+    await insertTicker(new Date());
+    const staleCheck: FreshnessCheck = {
+      label: "long_short_ratio",
+      staleAfterMs: STALE_AFTER_MS,
+      latestAt: async () => new Date(Date.now() - STALE_AFTER_MS - 60_000),
+    };
+    const freshCheck: FreshnessCheck = {
+      label: "orderbook_levels",
+      staleAfterMs: STALE_AFTER_MS,
+      latestAt: async () => new Date(),
+    };
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    // No nock interceptor — a ping here would be a real bug (fresh checks
+    // must not compensate for a stale one), and would fail loudly via nock's
+    // own "no match registered" error rather than silently passing.
+
+    const handle = startHeartbeat(`${BASE}${PING_PATH}`, 30, db, [freshCheck, staleCheck]);
+
+    await vi.waitFor(() => {
+      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("long_short_ratio stale beyond"));
+    });
+    // The fresh check's own label must never appear in a "stale beyond" log —
+    // only the genuinely stale one should be named.
+    expect(consoleErrorSpy).not.toHaveBeenCalledWith(expect.stringContaining("orderbook_levels stale beyond"));
+
+    await handle.stop();
+    consoleErrorSpy.mockRestore();
+  });
+
+  it("pings when every check across several independent streams is fresh", async () => {
+    const checks: FreshnessCheck[] = [
+      { label: "a", staleAfterMs: STALE_AFTER_MS, latestAt: async () => new Date() },
+      { label: "b", staleAfterMs: STALE_AFTER_MS, latestAt: async () => new Date() },
+      { label: "c", staleAfterMs: STALE_AFTER_MS, latestAt: async () => new Date() },
+    ];
+    let hits = 0;
+    nock(BASE).get(PING_PATH).query(true).reply(() => {
+      hits++;
+      return [200, "OK"];
+    });
+
+    const handle = startHeartbeat(`${BASE}${PING_PATH}`, 10_000, db, checks);
+
+    await vi.waitFor(() => expect(hits).toBeGreaterThanOrEqual(1));
+    await handle.stop();
+  });
+
   it("a failed ping (network error) is logged and does not stop future pings or throw", async () => {
     await insertTicker(new Date());
     const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     nock(BASE).get(PING_PATH).query(true).replyWithError(new Error("connection reset"));
     nock(BASE).get(PING_PATH).query(true).reply(200, "OK");
 
-    const handle = startHeartbeat(`${BASE}${PING_PATH}`, 30, db, STALE_AFTER_MS);
+    const handle = startHeartbeat(`${BASE}${PING_PATH}`, 30, db, tickersOnlyCheck());
 
     await vi.waitFor(() => {
       expect(consoleErrorSpy).toHaveBeenCalledWith("[heartbeat] ping failed:", expect.any(String));
@@ -148,7 +214,7 @@ describe("startHeartbeat (against a real local Postgres, mocked ping endpoint)",
     nock(BASE).get(PING_PATH).query(true).reply(500);
     nock(BASE).get(PING_PATH).query(true).reply(200, "OK");
 
-    const handle = startHeartbeat(`${BASE}${PING_PATH}`, 30, db, STALE_AFTER_MS);
+    const handle = startHeartbeat(`${BASE}${PING_PATH}`, 30, db, tickersOnlyCheck());
 
     await vi.waitFor(() => {
       expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("HTTP 500"));
@@ -175,7 +241,7 @@ describe("startHeartbeat (against a real local Postgres, mocked ping endpoint)",
       })
       .persist();
 
-    const handle = startHeartbeat(`${BASE}${PING_PATH}`, 30, db, STALE_AFTER_MS);
+    const handle = startHeartbeat(`${BASE}${PING_PATH}`, 30, db, tickersOnlyCheck());
     await vi.waitFor(() => expect(hits).toBeGreaterThanOrEqual(1));
 
     await handle.stop();
@@ -201,7 +267,7 @@ describe("startHeartbeat (against a real local Postgres, mocked ping endpoint)",
         return [200, "OK"];
       });
 
-    const handle = startHeartbeat(`${BASE}${PING_PATH}`, 10_000, db, STALE_AFTER_MS); // interval doesn't matter — only the first, in-flight ping is exercised here
+    const handle = startHeartbeat(`${BASE}${PING_PATH}`, 10_000, db, tickersOnlyCheck()); // interval doesn't matter — only the first, in-flight ping is exercised here
 
     // The heartbeat's own first tick fires on a 0ms setTimeout, which still
     // yields at least one event-loop turn — calling stop() before the first
