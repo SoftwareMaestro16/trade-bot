@@ -86,4 +86,42 @@ describe("PublicExchangeClient", () => {
 
     await expect(client.getInstrumentsInfo({ category: "linear" })).rejects.toBeInstanceOf(BybitError);
   });
+
+  it("aborts a call that hangs past requestTimeoutMs instead of waiting forever (2026-08-07 production incident: a single stalled request with no timeout blocked collectSettledFunding's entire sequential sweep, and therefore every future sweep, permanently)", async () => {
+    // Simulates a black-holed connection: nock never actually answers within
+    // this test's lifetime, standing in for a stalled TCP connection with no
+    // RST — the same class of failure telegramPolling.test.ts's own
+    // "aborts a getUpdates call that hangs" test simulates the same way.
+    nock(TESTNET_BASE).get("/v5/market/instruments-info").query(true).delay(60_000).reply(200, {
+      retCode: 0,
+      retMsg: "OK",
+      result: { category: "linear", list: [] },
+      retExtInfo: {},
+      time: Date.now(),
+    });
+
+    const client = new PublicExchangeClient({ testnet: true, requestTimeoutMs: 100 });
+
+    await expect(client.getInstrumentsInfo({ category: "linear" })).rejects.toMatchObject({
+      kind: "network",
+    });
+  });
+
+  it("does not abort a call that resolves comfortably within requestTimeoutMs", async () => {
+    nock(TESTNET_BASE)
+      .get("/v5/market/instruments-info")
+      .query(true)
+      .delay(10)
+      .reply(200, {
+        retCode: 0,
+        retMsg: "OK",
+        result: { category: "linear", list: [] },
+        retExtInfo: {},
+        time: Date.now(),
+      });
+
+    const client = new PublicExchangeClient({ testnet: true, requestTimeoutMs: 5000 });
+
+    await expect(client.getInstrumentsInfo({ category: "linear" })).resolves.toMatchObject({ retCode: 0 });
+  });
 });

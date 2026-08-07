@@ -8,6 +8,8 @@
 export interface TelegramConfig {
   botToken: string;
   allowedChatId: string; // RR-33 (SRS.md): the single whitelisted chat_id.
+  /** Overridable only so tests don't have to wait out the real default (see TELEGRAM_REQUEST_TIMEOUT_MS). */
+  requestTimeoutMs?: number;
 }
 
 export interface SendAlertOptions {
@@ -83,6 +85,29 @@ function safeJsonParse(raw: string): unknown {
 }
 
 /**
+ * Found 2026-08-07, same-day production incident: exchange/client.ts's
+ * Bybit calls had no request timeout, a single stalled connection blocked
+ * an entire collector cycle forever (see that file's own doc comment for
+ * the full story), and telegramPolling/loop.ts's getUpdates call already
+ * had its own fetchTimeoutMs specifically to prevent this. This file's own
+ * outbound calls (postToTelegram, sendDocument) had the identical gap — a
+ * bare `fetch()` with no AbortController, unnoticed until the sibling
+ * incident prompted checking here too. Node's global `fetch` has no default
+ * timeout of its own. A stalled Telegram call wouldn't crash anything (it's
+ * just an unresolved promise), but it WOULD hang killswitch-listener.ts's
+ * inFlightPersists.track()'d alert forever, which would hang shutdown()'s
+ * drain() forever, and — more seriously — notify/notificationQueue.ts's
+ * periodic 15-minute deliverPending retry (scheduleRepeating's own "run,
+ * then wait, then run again" pattern) would never reach "run again" if one
+ * delivery attempt got stuck — silently defeating the durable queue's whole
+ * purpose the exact same way the settled-funding sweep got silently stuck.
+ * 15s matches exchange/client.ts's own REQUEST_TIMEOUT_MS reasoning:
+ * generous for what should normally be a sub-second API call, bounded
+ * regardless.
+ */
+const TELEGRAM_REQUEST_TIMEOUT_MS = 15_000;
+
+/**
  * POSTs to a Telegram Bot API method and applies the shared failure-detection
  * discipline both `sendAlert` and `sendRichMessage` need: throw on network
  * failure, on any non-2xx HTTP response, AND on Telegram's own `ok: false`
@@ -90,20 +115,54 @@ function safeJsonParse(raw: string): unknown {
  * body — an HTTP-status-only check would silently swallow that). Never logs
  * or rethrows `url` itself, since it embeds `config.botToken`.
  */
-async function postToTelegram(url: string, payload: unknown, methodNameForErrors: string): Promise<void> {
+async function postToTelegram(
+  url: string,
+  payload: unknown,
+  methodNameForErrors: string,
+  timeoutMs: number = TELEGRAM_REQUEST_TIMEOUT_MS,
+): Promise<void> {
+  // Same reasoning as telegramPolling/loop.ts's pollOnce: covers both the
+  // fetch() call and the response.text() read below via the same signal —
+  // a connection can stall mid-body-read just as easily as before the first
+  // byte, and both must be bounded, not just the first.
+  const abortController = new AbortController();
+  const timeoutTimer = setTimeout(() => abortController.abort(), timeoutMs);
+
   let response: Response;
   try {
     response = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
+      signal: abortController.signal,
     });
   } catch (e) {
-    const message = typeof e === "string" ? e : e instanceof Error ? e.message : "unrecognized error shape";
+    clearTimeout(timeoutTimer);
+    const message = abortController.signal.aborted
+      ? `timed out after ${String(timeoutMs)}ms`
+      : typeof e === "string"
+        ? e
+        : e instanceof Error
+          ? e.message
+          : "unrecognized error shape";
     throw new TelegramApiError(`Telegram ${methodNameForErrors} network error: ${message}`);
   }
 
-  const rawBody = await response.text();
+  let rawBody: string;
+  try {
+    rawBody = await response.text();
+  } catch (e) {
+    clearTimeout(timeoutTimer);
+    const message = abortController.signal.aborted
+      ? `timed out after ${String(timeoutMs)}ms (mid-body-read)`
+      : typeof e === "string"
+        ? e
+        : e instanceof Error
+          ? e.message
+          : "unrecognized error shape";
+    throw new TelegramApiError(`Telegram ${methodNameForErrors} network error: ${message}`);
+  }
+  clearTimeout(timeoutTimer);
   const parsed = safeJsonParse(rawBody);
   const body = isHasOk(parsed) ? parsed : undefined;
   const description = body !== undefined && typeof body.description === "string" ? body.description : undefined;
@@ -140,7 +199,12 @@ export async function sendAlert(config: TelegramConfig, text: string, options?: 
   if (options?.replyMarkup) {
     payload.reply_markup = toWireKeyboard(options.replyMarkup);
   }
-  await postToTelegram(`https://api.telegram.org/bot${config.botToken}/sendMessage`, payload, "sendMessage");
+  await postToTelegram(
+    `https://api.telegram.org/bot${config.botToken}/sendMessage`,
+    payload,
+    "sendMessage",
+    config.requestTimeoutMs,
+  );
 }
 
 /**
@@ -166,7 +230,12 @@ export async function sendRichMessage(config: TelegramConfig, markdown: string):
     chat_id: config.allowedChatId,
     rich_message: { markdown },
   };
-  await postToTelegram(`https://api.telegram.org/bot${config.botToken}/sendRichMessage`, payload, "sendRichMessage");
+  await postToTelegram(
+    `https://api.telegram.org/bot${config.botToken}/sendRichMessage`,
+    payload,
+    "sendRichMessage",
+    config.requestTimeoutMs,
+  );
 }
 
 export interface EditMessageOptions {
@@ -208,7 +277,12 @@ export async function editMessageText(
   if (options?.replyMarkup) {
     payload.reply_markup = toWireKeyboard(options.replyMarkup);
   }
-  await postToTelegram(`https://api.telegram.org/bot${config.botToken}/editMessageText`, payload, "editMessageText");
+  await postToTelegram(
+    `https://api.telegram.org/bot${config.botToken}/editMessageText`,
+    payload,
+    "editMessageText",
+    config.requestTimeoutMs,
+  );
 }
 
 export interface AnswerCallbackQueryOptions {
@@ -245,6 +319,7 @@ export async function answerCallbackQuery(
     `https://api.telegram.org/bot${config.botToken}/answerCallbackQuery`,
     payload,
     "answerCallbackQuery",
+    config.requestTimeoutMs,
   );
 }
 
@@ -329,18 +404,50 @@ export async function sendDocument(
     form.append("caption", options.caption);
   }
 
+  // Same TELEGRAM_REQUEST_TIMEOUT_MS/AbortController treatment as
+  // postToTelegram (see that constant's own doc comment) — the signal
+  // covers throwOnTelegramFailure's own response.text() read below too,
+  // same as it does for postToTelegram's inline equivalent.
+  const timeoutMs = config.requestTimeoutMs ?? TELEGRAM_REQUEST_TIMEOUT_MS;
+  const abortController = new AbortController();
+  const timeoutTimer = setTimeout(() => abortController.abort(), timeoutMs);
+
   let response: Response;
   try {
     response = await fetch(`https://api.telegram.org/bot${config.botToken}/sendDocument`, {
       method: "POST",
       body: form,
+      signal: abortController.signal,
     });
   } catch (e) {
-    const message = typeof e === "string" ? e : e instanceof Error ? e.message : "unrecognized error shape";
+    clearTimeout(timeoutTimer);
+    const message = abortController.signal.aborted
+      ? `timed out after ${String(timeoutMs)}ms`
+      : typeof e === "string"
+        ? e
+        : e instanceof Error
+          ? e.message
+          : "unrecognized error shape";
     throw new TelegramApiError(`Telegram sendDocument network error: ${message}`);
   }
 
-  await throwOnTelegramFailure(response, "sendDocument");
+  try {
+    await throwOnTelegramFailure(response, "sendDocument");
+  } catch (e) {
+    // throwOnTelegramFailure's own response.text() can itself be the thing
+    // that stalls (headers arrived, body didn't) — its rejection on abort is
+    // a raw AbortError, not yet a TelegramApiError, so it's normalized here
+    // rather than left to leak an unnormalized shape to the caller.
+    if (e instanceof TelegramApiError) throw e;
+    clearTimeout(timeoutTimer);
+    const message = abortController.signal.aborted
+      ? `timed out after ${String(timeoutMs)}ms (mid-body-read)`
+      : e instanceof Error
+        ? e.message
+        : "unrecognized error shape";
+    throw new TelegramApiError(`Telegram sendDocument network error: ${message}`);
+  }
+  clearTimeout(timeoutTimer);
 }
 
 export interface IncomingCommand {

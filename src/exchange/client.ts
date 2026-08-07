@@ -4,7 +4,39 @@ import { BybitError, normalizeBybitError } from "./errors.js";
 
 export interface PublicExchangeClientOptions {
   testnet: boolean;
+  /** Overridable only so tests don't have to wait out the real default. */
+  requestTimeoutMs?: number;
 }
+
+/**
+ * Found 2026-08-07, live production incident: `collectSettledFunding`'s
+ * per-symbol sweep (293 symbols, sequential via exchange/rateLimiter.ts)
+ * has NO bound on any single HTTP call's duration — Node's global `fetch`
+ * has no default timeout (same fact telegramPolling/loop.ts's own
+ * fetchTimeoutMs comment already documents for its own getUpdates call, but
+ * that fix was never applied here), and bybit-api's RestClientV5 wraps
+ * axios internally, which ALSO has no default timeout. A single stalled TCP
+ * connection (no RST, no response — a black-holed request) blocks that one
+ * `await` forever, which blocks the whole sequential sweep forever (nothing
+ * after it in the `for` loop ever runs), which means scheduleRepeating's
+ * "run, then wait intervalMs, then run again" pattern never reaches "wait,
+ * then run again" — no future settled-funding write, ever, until the whole
+ * process is restarted. Confirmed live: a stalled request left one
+ * ESTABLISHED TCP connection open for 5+ minutes with ~0 CPU usage on the
+ * process, funding_rates(settled) frozen the entire time.
+ *
+ * Fix: RestClientV5's constructor accepts a second `AxiosRequestConfig`
+ * parameter (bybit-api uses axios, not raw fetch, under the hood) — axios's
+ * own `timeout` option aborts a request that takes longer than this and
+ * rejects with an Error (`code: 'ECONNABORTED'`), which normalizeBybitError
+ * below already classifies correctly as `kind: "network"` (it falls through
+ * to the generic `e instanceof Error` branch — no new error shape to handle).
+ * 15s is generous for what should normally be a sub-second REST call
+ * (matching this codebase's own NFR-04 rate-limit spacing of 150-180ms
+ * between calls), while still bounding the worst case to seconds, not
+ * "until someone notices and restarts the process."
+ */
+const REQUEST_TIMEOUT_MS = 15_000;
 
 /**
  * ADR-002: the only place in this codebase allowed to import `bybit-api` directly
@@ -18,12 +50,15 @@ export class PublicExchangeClient {
   private readonly raw: RestClientV5;
 
   constructor(options: PublicExchangeClientOptions) {
-    this.raw = new RestClientV5({
-      testnet: options.testnet,
-      // RR-51: the library defaults this to false, which resolves a retCode-failed
-      // order as if it succeeded. Never rely on this default.
-      throwExceptions: true,
-    });
+    this.raw = new RestClientV5(
+      {
+        testnet: options.testnet,
+        // RR-51: the library defaults this to false, which resolves a retCode-failed
+        // order as if it succeeded. Never rely on this default.
+        throwExceptions: true,
+      },
+      { timeout: options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS },
+    );
   }
 
   /** Wraps every raw call: normalizes errors (RR-03) and double-checks retCode (RR-51). */

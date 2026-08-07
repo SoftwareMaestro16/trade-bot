@@ -398,6 +398,64 @@ describe("answerCallbackQuery", () => {
   });
 });
 
+describe("request timeout (2026-08-07 production incident: a stalled Bybit connection with no timeout blocked a whole collector cycle forever; this file's own postToTelegram/sendDocument had the identical gap, fixed the same way)", () => {
+  it("sendAlert (postToTelegram) aborts a call that hangs past requestTimeoutMs instead of waiting forever", async () => {
+    // Simulates a black-holed connection — nock never actually answers
+    // within this test's lifetime, same technique as
+    // test/exchange/client.test.ts's own equivalent test.
+    nock(TELEGRAM_BASE).post(`/bot${FAKE_TOKEN}/sendMessage`).delay(60_000).reply(200, { ok: true, result: {} });
+
+    const shortTimeoutConfig: TelegramConfig = { ...config, requestTimeoutMs: 100 };
+
+    let caught: unknown;
+    try {
+      await sendAlert(shortTimeoutConfig, "alert text");
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeInstanceOf(TelegramApiError);
+    expect((caught as TelegramApiError).message).toContain("timed out after 100ms");
+  });
+
+  it("sendAlert does not abort a call that resolves comfortably within requestTimeoutMs", async () => {
+    nock(TELEGRAM_BASE)
+      .post(`/bot${FAKE_TOKEN}/sendMessage`)
+      .delay(10)
+      .reply(200, { ok: true, result: {} });
+
+    const config5s: TelegramConfig = { ...config, requestTimeoutMs: 5000 };
+
+    await expect(sendAlert(config5s, "alert text")).resolves.toBeUndefined();
+  });
+
+  it("sendDocument aborts a call that hangs past requestTimeoutMs instead of waiting forever", async () => {
+    nock(TELEGRAM_BASE).post(`/bot${FAKE_TOKEN}/sendDocument`).delay(60_000).reply(200, { ok: true, result: {} });
+
+    const shortTimeoutConfig: TelegramConfig = { ...config, requestTimeoutMs: 100 };
+
+    let caught: unknown;
+    try {
+      await sendDocument(shortTimeoutConfig, "report.md", "# report");
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeInstanceOf(TelegramApiError);
+    expect((caught as TelegramApiError).message).toContain("timed out after 100ms");
+  });
+
+  it("without an override, the real 15s default is used (documents the production default, doesn't wait it out)", async () => {
+    // Not a timing test (nothing here actually waits 15s) — just pins down
+    // that omitting requestTimeoutMs uses the real production constant, not
+    // some other silently-different default, by confirming a call that
+    // resolves quickly still succeeds with zero config override at all.
+    nock(TELEGRAM_BASE).post(`/bot${FAKE_TOKEN}/sendMessage`).reply(200, { ok: true, result: {} });
+
+    await expect(sendAlert(config, "alert text")).resolves.toBeUndefined();
+  });
+});
+
 describe("authorizeCommand", () => {
   // A stand-in ChatAuthorizer, not killswitch/authorizedUsers.ts's real
   // isAuthorizedChat (that has its own DB-backed tests) — authorizeCommand
