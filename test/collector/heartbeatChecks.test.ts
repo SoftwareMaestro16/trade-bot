@@ -6,6 +6,7 @@ import type { Database } from "../../src/storage/schema.js";
 
 const DB_STALE_AFTER_MS = 111;
 const SLOW_STREAM_STALE_AFTER_MS = 222;
+const SETTLED_FUNDING_STALE_AFTER_MS = 333;
 const SYM = "__TEST_COLLECTOR_HEARTBEAT__USDT";
 
 /**
@@ -28,7 +29,7 @@ describe("buildFreshnessChecks", () => {
   afterAll(async () => db.destroy());
 
   it("returns exactly the four labels collector.ts wired up, with the right staleAfterMs each", () => {
-    const checks = buildFreshnessChecks(DB_STALE_AFTER_MS, SLOW_STREAM_STALE_AFTER_MS);
+    const checks = buildFreshnessChecks(DB_STALE_AFTER_MS, SLOW_STREAM_STALE_AFTER_MS, SETTLED_FUNDING_STALE_AFTER_MS);
 
     expect(checks.map((c) => c.label)).toEqual([
       "tickers",
@@ -39,11 +40,13 @@ describe("buildFreshnessChecks", () => {
     expect(checks.find((c) => c.label === "tickers")?.staleAfterMs).toBe(DB_STALE_AFTER_MS);
     expect(checks.find((c) => c.label === "orderbook_levels")?.staleAfterMs).toBe(DB_STALE_AFTER_MS);
     expect(checks.find((c) => c.label === "long_short_ratio")?.staleAfterMs).toBe(SLOW_STREAM_STALE_AFTER_MS);
-    expect(checks.find((c) => c.label === "funding_rates(settled)")?.staleAfterMs).toBe(SLOW_STREAM_STALE_AFTER_MS);
+    expect(checks.find((c) => c.label === "funding_rates(settled)")?.staleAfterMs).toBe(
+      SETTLED_FUNDING_STALE_AFTER_MS,
+    );
   });
 
   it("each check's latestAt resolves null when its own table/filter has no rows for it", async () => {
-    const checks = buildFreshnessChecks(DB_STALE_AFTER_MS, SLOW_STREAM_STALE_AFTER_MS);
+    const checks = buildFreshnessChecks(DB_STALE_AFTER_MS, SLOW_STREAM_STALE_AFTER_MS, SETTLED_FUNDING_STALE_AFTER_MS);
     for (const check of checks) {
       await expect(check.latestAt(db)).resolves.toBeNull();
     }
@@ -61,7 +64,7 @@ describe("buildFreshnessChecks", () => {
       })
       .execute();
 
-    const checks = buildFreshnessChecks(DB_STALE_AFTER_MS, SLOW_STREAM_STALE_AFTER_MS);
+    const checks = buildFreshnessChecks(DB_STALE_AFTER_MS, SLOW_STREAM_STALE_AFTER_MS, SETTLED_FUNDING_STALE_AFTER_MS);
     const settledCheck = checks.find((c) => c.label === "funding_rates(settled)");
     if (!settledCheck) throw new Error("expected a funding_rates(settled) check");
 
@@ -77,7 +80,7 @@ describe("buildFreshnessChecks", () => {
       .values({ symbol: SYM, category: "linear", last_price: "1.0", fetched_at: fetchedAt })
       .execute();
 
-    const checks = buildFreshnessChecks(DB_STALE_AFTER_MS, SLOW_STREAM_STALE_AFTER_MS);
+    const checks = buildFreshnessChecks(DB_STALE_AFTER_MS, SLOW_STREAM_STALE_AFTER_MS, SETTLED_FUNDING_STALE_AFTER_MS);
     const tickersCheck = checks.find((c) => c.label === "tickers");
     if (!tickersCheck) throw new Error("expected a tickers check");
 

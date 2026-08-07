@@ -87,13 +87,32 @@ const HEARTBEAT_INTERVAL_MS = 5 * 60_000;
 // either way.
 const DB_STALE_AFTER_MS = 10 * 60_000;
 
-// Same reasoning as DB_STALE_AFTER_MS, but for the two collectors that run
-// every 5 minutes (LONG_SHORT_INTERVAL_MS/SETTLED_FUNDING_INTERVAL_MS) —
-// 20 minutes tolerates ~4 consecutive missed cycles, keeping the same
-// "generous but not blind" ratio (~10x the real interval) as the 60s streams
-// above, rather than reusing DB_STALE_AFTER_MS unchanged and effectively
-// tightening their tolerance to only ~2 missed cycles.
+// Same reasoning as DB_STALE_AFTER_MS, for long_short_ratio (runs every 5min,
+// LONG_SHORT_INTERVAL_MS) — 20 minutes tolerates ~4 consecutive missed
+// cycles, keeping the same "generous but not blind" ratio (~10x the real
+// interval) as the 60s streams above. Bybit's long/short-ratio endpoint
+// returns a value on EVERY poll (it's a live snapshot, not an event), so
+// every successful cycle writes fresh rows — "stale" here really does mean
+// "cycles are failing/being missed."
 const SLOW_STREAM_STALE_AFTER_MS = 20 * 60_000;
+
+// funding_rates(settled) is NOT like long_short_ratio above despite running
+// on the same SETTLED_FUNDING_INTERVAL_MS (5min) schedule: it only writes a
+// row when a symbol's funding actually SETTLES, which happens on that
+// symbol's own interval_minutes (RISK-REGISTER.md FM-04's "live field") —
+// 60/240/480 observed across the current universe. Almost every 5-minute
+// cycle correctly finds nothing new and writes zero rows; that is success,
+// not a missed cycle, and treating it like SLOW_STREAM_STALE_AFTER_MS's 20
+// minutes produced hourly false-positive healthchecks.io DOWN/UP alerts all
+// day on 2026-08-07 (confirmed live: cycles completing every 5min with zero
+// errors, ~50-70ms Bybit response times, real writes landing roughly once
+// per hour driven by whichever symbols sit on the shortest 60min interval).
+// Threshold is the longest funding interval actually seen (480min = Bybit's
+// standard 8h ceiling) plus one hour of buffer for poll-cycle granularity
+// and the case where no currently-short-interval symbol happens to be due —
+// comfortably tighter than "never alerts" while no longer alarming on this
+// stream's normal, event-driven silence.
+const SETTLED_FUNDING_STALE_AFTER_MS = 540 * 60_000;
 
 // notificationQueue.ts's own retry cadence for anything still sitting
 // undelivered (Telegram was down, network blip, etc.) — independent of the
@@ -266,7 +285,11 @@ async function main(): Promise<void> {
   // and for why these four checks (not six, not one) are exactly the
   // independently-scheduled write paths worth gating the ping on.
   if (env.HEALTHCHECK_PING_URL) {
-    const freshnessChecks = buildFreshnessChecks(DB_STALE_AFTER_MS, SLOW_STREAM_STALE_AFTER_MS);
+    const freshnessChecks = buildFreshnessChecks(
+      DB_STALE_AFTER_MS,
+      SLOW_STREAM_STALE_AFTER_MS,
+      SETTLED_FUNDING_STALE_AFTER_MS,
+    );
     tasks.push(startHeartbeat(env.HEALTHCHECK_PING_URL, HEARTBEAT_INTERVAL_MS, db, freshnessChecks));
     logger.info(
       {
