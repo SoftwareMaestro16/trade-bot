@@ -6,6 +6,7 @@ import { computeNextPositionSizeFraction } from "../adaptivePositionSizing.js";
 import type { TradeOutcome } from "../adaptivePositionSizing.js";
 import { transition } from "../paperPositionState.js";
 import type { PaperPositionState } from "../paperPositionState.js";
+import { checkDrawdown } from "../../risk/drawdown.js";
 import { getTickTimestamps, latestTickerAtOrBefore } from "./dbReaders.js";
 import { pickBestCandidate } from "./candidateSelection.js";
 import { openNewPosition, closePosition } from "./positionLifecycle.js";
@@ -26,7 +27,12 @@ import type { ScenarioConfig, ScenarioRunResult, ResolvedScenarioConfig, OpenPos
 // Equity snapshots
 // ---------------------------------------------------------------------------
 
-/** Writes one paper_equity_snapshots row and returns the (possibly updated) all-time peak equity. */
+/**
+ * Writes one paper_equity_snapshots row and returns both the (possibly
+ * updated) all-time peak equity and this tick's own total equity — the
+ * latter is what executeScenario's drawdown check (RR-40/41/42,
+ * PARAMS-CONSERVATIVE.md §8) compares against the former.
+ */
 async function writeEquitySnapshot(
   db: Kysely<Database>,
   scenarioId: bigint,
@@ -34,7 +40,7 @@ async function writeEquitySnapshot(
   pos: OpenPositionState | null,
   cashOutsidePosition: Big,
   peakEquity: Big,
-): Promise<Big> {
+): Promise<{ peakEquity: Big; totalEquity: Big }> {
   let totalEquity: Big;
   let marginBalance: Big;
 
@@ -76,7 +82,29 @@ async function writeEquitySnapshot(
     })
     .execute();
 
-  return isPeak ? totalEquity : peakEquity;
+  return { peakEquity: isPeak ? totalEquity : peakEquity, totalEquity };
+}
+
+/**
+ * Force-closes `pos` at the latest available mark price (falling back to its
+ * own entry price if no fresher ticker exists) and returns the cash proceeds.
+ * Shared by both forced-close sites (drawdown breach mid-run, and the
+ * unconditional end-of-range close below) so they can't silently drift out
+ * of sync on how "current price" is resolved.
+ */
+async function forceClosePosition(
+  db: Kysely<Database>,
+  pos: OpenPositionState,
+  t: Date,
+  reasonCode: string,
+  reasonDetail: string,
+  resolved: ResolvedScenarioConfig,
+): Promise<Big> {
+  const perpTicker = await latestTickerAtOrBefore(db, pos.symbol, "linear", t);
+  const spotTicker = await latestTickerAtOrBefore(db, pos.symbol, "spot", t);
+  const perpExitPrice = perpTicker?.markPrice ?? pos.perpEntryPrice;
+  const spotExitPrice = spotTicker?.lastPrice ?? pos.spotEntryPrice;
+  return closePosition(db, pos, t, perpExitPrice, spotExitPrice, reasonCode, reasonDetail, resolved);
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +154,16 @@ async function executeScenario(
   let paperState: PaperPositionState = "IDLE";
   let positionsOpened = 0;
   let positionsClosed = 0;
+  // PARAMS-CONSERVATIVE.md §8/§9: "Просадка выше 3% -> закрыть всё по рынку,
+  // стоп до ручного рестарта" — once tripped, no new entries for the REST of
+  // this run (peak is never auto-reset; a scenario run has no "manual
+  // restart" concept, so the halt simply persists to the end of the range).
+  // Found missing 2026-08-08 by a risk-register-enforcement audit:
+  // checkDrawdown (risk/drawdown.ts) was correctly implemented and unit
+  // tested but never actually called anywhere in this live tick loop —
+  // reportGenerator's computeMaxDrawdownPct only computes it AFTER the fact
+  // for the report, which cannot and does not stop anything.
+  let drawdownHalted = false;
   // Owner's own sizing rule (2026-08-07, see module doc comment): small with
   // no track record or after a significant loss, larger after a run of
   // wins. This scenario's OWN closed-trade history, oldest first — fed into
@@ -153,8 +191,10 @@ async function executeScenario(
       }
     }
 
-    // RR-22: only ever evaluated while flat — see module doc comment.
-    if (!openPosition && cashOutsidePosition.gt(0)) {
+    // RR-22: only ever evaluated while flat. Also gated on !drawdownHalted —
+    // PARAMS-CONSERVATIVE.md §9: a drawdown breach means "стоп до ручного
+    // рестарта", not "close this one position and keep trading."
+    if (!openPosition && !drawdownHalted && cashOutsidePosition.gt(0)) {
       const sizeFraction = computeNextPositionSizeFraction(closedTradeHistory);
       const winner = await pickBestCandidate(db, resolved, t, cashOutsidePosition, sizeFraction);
       if (winner) {
@@ -166,24 +206,48 @@ async function executeScenario(
       }
     }
 
-    peakEquity = await writeEquitySnapshot(db, scenarioId, t, openPosition, cashOutsidePosition, peakEquity);
+    const snapshot = await writeEquitySnapshot(db, scenarioId, t, openPosition, cashOutsidePosition, peakEquity);
+    peakEquity = snapshot.peakEquity;
+
+    // RR-40/41/42, PARAMS-CONSERVATIVE.md §8/§9: checked every tick, not just
+    // at scenario end — a real drawdown-triggered stop must fire the moment
+    // it's crossed, not get discovered only when the report is generated
+    // afterward.
+    const drawdownResult = checkDrawdown(snapshot.totalEquity, peakEquity);
+    if (!drawdownHalted && !drawdownResult.allowed) {
+      drawdownHalted = true;
+      if (openPosition) {
+        const cashReturned = await forceClosePosition(
+          db,
+          openPosition,
+          t,
+          "DRAWDOWN_EXCEEDED",
+          `${drawdownResult.reason} Force-closed and halting new entries for the rest of this scenario ` +
+            '(PARAMS-CONSERVATIVE.md §9: "стоп до ручного рестарта").',
+          resolved,
+        );
+        closedTradeHistory.push({
+          realizedPnl: cashReturned.minus(openPosition.initialCapital),
+          equityAtClose: cashOutsidePosition.plus(cashReturned),
+        });
+        cashOutsidePosition = cashOutsidePosition.plus(cashReturned);
+        paperState = transition(paperState, "RISK_FORCE_CLOSE");
+        paperState = transition(paperState, "BOTH_LEGS_CLOSED");
+        paperState = transition(paperState, "JOURNALED");
+        openPosition = null;
+        positionsClosed++;
+      }
+    }
   }
 
   // Never leave a position open at the end of the range.
   if (openPosition) {
     const lastT = ticks[ticks.length - 1];
     if (lastT) {
-      const perpTicker = await latestTickerAtOrBefore(db, openPosition.symbol, "linear", lastT);
-      const spotTicker = await latestTickerAtOrBefore(db, openPosition.symbol, "spot", lastT);
-      const perpExitPrice = perpTicker?.markPrice ?? openPosition.perpEntryPrice;
-      const spotExitPrice = spotTicker?.lastPrice ?? openPosition.spotEntryPrice;
-
-      const cashReturned = await closePosition(
+      const cashReturned = await forceClosePosition(
         db,
         openPosition,
         lastT,
-        perpExitPrice,
-        spotExitPrice,
         "SCENARIO_END",
         "Scenario date range ended with the position still open — force-closed at the last tick so no paper " +
           "position outlives its own run (never a strategy or risk decision).",
@@ -200,7 +264,7 @@ async function executeScenario(
       openPosition = null;
       positionsClosed++;
 
-      peakEquity = await writeEquitySnapshot(db, scenarioId, lastT, null, cashOutsidePosition, peakEquity);
+      await writeEquitySnapshot(db, scenarioId, lastT, null, cashOutsidePosition, peakEquity);
     }
   }
 

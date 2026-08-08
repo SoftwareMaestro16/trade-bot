@@ -7,11 +7,7 @@ import {
   SPOT_TAKER_FEE_RATE_FALLBACK,
   PERP_TAKER_FEE_RATE_FALLBACK,
 } from "../../src/emulation/scenarioRunner.js";
-import {
-  computeNextPositionSizeFraction,
-  NO_HISTORY_FRACTION,
-  SIGNIFICANT_LOSS_THRESHOLD_PCT_OF_EQUITY,
-} from "../../src/emulation/adaptivePositionSizing.js";
+import { computeNextPositionSizeFraction, NO_HISTORY_FRACTION } from "../../src/emulation/adaptivePositionSizing.js";
 import { computeRealizedPnl } from "../../src/execution/realizedPnl.js";
 import { sizePosition } from "../../src/strategy/sizing.js";
 import { createDb } from "../../src/storage/db.js";
@@ -28,6 +24,7 @@ import type { Database } from "../../src/storage/schema.js";
 const ALL_TEST_SYMBOLS = [
   "__TEST_SCN_LOOKAHEAD__USDT",
   "__TEST_SCN_INTERVAL240__USDT",
+  "__TEST_SCN_DRAWDOWN__USDT",
   "__TEST_SCN_MULTIA__USDT",
   "__TEST_SCN_MULTIB__USDT",
   "__TEST_SCN_MULTIC__USDT",
@@ -545,94 +542,228 @@ describe("runScenario", () => {
   );
 
   it(
-    "threads THIS scenario's own closed-trade history into computeNextPositionSizeFraction across two SEQUENTIAL " +
+    "force-closes via DRAWDOWN_EXCEEDED when total equity falls 3% from its peak (PARAMS-CONSERVATIVE.md §8), and " +
+      "then refuses every further entry for the rest of the run (§9: \"стоп до ручного рестарта\") even though a " +
+      "fresh, fully-qualifying candidate appears afterward — regression test for a real gap found 2026-08-08: " +
+      "risk/drawdown.ts's checkDrawdown was correctly implemented and unit-tested but was never actually called " +
+      "anywhere in executeScenario's live tick loop, so nothing ever stopped a losing run",
+    async () => {
+      const symbol = "__TEST_SCN_DRAWDOWN__USDT";
+      const nextFunding = (t: Date) => new Date(t.getTime() + 6 * 60 * 60 * 1000);
+      const hour = (n: number) => new Date(new Date("2026-06-01T00:00:00.000Z").getTime() + n * 60 * 60 * 1000);
+
+      // A single held position can't reach 3% drawdown on its own: risk/
+      // leverage.ts's checkConcentration caps any one symbol's spot-leg
+      // notional at 25% of total equity (PARAMS-CONSERVATIVE.md §11) — on a
+      // $500 deposit that's a $125 notional ceiling, and even a full forced-
+      // liquidation-magnitude move on a position that small is a small slice
+      // of total equity. So this constructs the REALISTIC path to a 3%
+      // drawdown instead: a STREAK of ordinary small losing trades (each
+      // closing normally via its own BASIS_DIVERGED exit, nothing new being
+      // tested there), whose cumulative erosion eventually crosses the 3%
+      // floor — exactly the "no single trade looks alarming, the streak is
+      // what matters" case only a real drawdown check can catch.
+      //
+      // Each cycle (2 ticks): open flat at parity with a $100 notional
+      // (comfortably under the $125 concentration cap even as equity
+      // shrinks slightly cycle over cycle), then perp jumps +5% (safely
+      // under 10x leverage's own ~107.84 forced-liquidation price per the
+      // "closes a position via ... simulateDeltaNeutralForcedLiquidation"
+      // fixture's own derivation above, and well over exitRules.ts's 0.5%
+      // BASIS_DIVERGED threshold, so it self-closes cleanly) — realizing a
+      // loss of roughly notional×divergence ≈ $5, ~1% of current equity per
+      // cycle. 8 cycles compounds well past 3% before the last one, leaving
+      // room to prove the halt actually stops later, still-fully-qualifying
+      // cycles from ever opening.
+      const CYCLES = 8;
+      for (let i = 0; i < CYCLES; i++) {
+        const tOpen = hour(i * 2);
+        const tClose = hour(i * 2 + 1);
+        await insertTickerPair(db, symbol, tOpen, "100");
+        await insertDeepBook(db, symbol, tOpen, "100");
+        await insertPredictedFunding(db, symbol, tOpen, "0.001", nextFunding(tOpen)); // HIGH_RATE — clears every entry gate
+        await db
+          .insertInto("tickers")
+          .values([
+            {
+              symbol,
+              category: "linear",
+              last_price: "105",
+              mark_price: "105",
+              index_price: "105",
+              volume_24h: null,
+              turnover_24h: GENEROUS_TURNOVER,
+              fetched_at: tClose,
+            },
+            {
+              symbol,
+              category: "spot",
+              last_price: "100", // spot unchanged — the whole 5% is basis divergence
+              mark_price: null,
+              index_price: null,
+              volume_24h: null,
+              turnover_24h: GENEROUS_TURNOVER,
+              fetched_at: tClose,
+            },
+          ])
+          .execute();
+        await insertPredictedFunding(db, symbol, tClose, "0.001", nextFunding(tClose));
+      }
+
+      const result = await runScenario(db, {
+        name: "__test_drawdown_halt__",
+        leverage: new Big("10"),
+        startingDeposit: new Big("500"),
+        // Fixed notional, not the adaptive-sizing default (irrelevant here
+        // either way since every cycle is a fresh flat entry) — kept well
+        // under risk/leverage.ts's checkConcentration cap (25% of equity,
+        // PARAMS-CONSERVATIVE.md §11 — $125 on this $500 deposit) even after
+        // several cycles' worth of ~1% erosion.
+        positionSizeUsd: new Big("100"),
+        symbols: [symbol],
+        startAt: hour(0),
+        endAt: hour(CYCLES * 2 - 1),
+      });
+      scenarioIdsToClean.push(result.scenarioId);
+
+      expect(result.ticksProcessed).toBe(CYCLES * 2);
+
+      // The core assertion: the halt actually stopped later cycles from
+      // opening — fewer positions opened than the CYCLES offered, even
+      // though every single one of them was, on its own, a fully-qualifying
+      // candidate (same fixture shape every time).
+      expect(result.positionsOpened).toBeGreaterThan(0);
+      expect(result.positionsOpened).toBeLessThan(CYCLES);
+      expect(result.positionsClosed).toBe(result.positionsOpened);
+
+      // The peak-equity ledger itself must show the breach: at least one
+      // snapshot sits >= 3% below the run's own recorded peak.
+      const snapshots = await db
+        .selectFrom("paper_equity_snapshots")
+        .selectAll()
+        .where("scenario_id", "=", result.scenarioId)
+        .orderBy("at", "asc")
+        .execute();
+      let peak = new Big(0);
+      let maxDrawdown = new Big(0);
+      for (const s of snapshots) {
+        const equity = new Big(s.total_equity);
+        if (equity.gt(peak)) peak = equity;
+        else if (peak.gt(0)) {
+          const dd = peak.minus(equity).div(peak);
+          if (dd.gt(maxDrawdown)) maxDrawdown = dd;
+        }
+      }
+      expect(maxDrawdown.gte("0.03")).toBe(true);
+
+      // Every cycle is an IDENTICAL, fully-qualifying fixture (same
+      // turnover/premium/entry-threshold numbers every time — already
+      // proven capable of opening by the earlier cycles that did). Nothing
+      // else in the system varies between cycles, so the only thing that
+      // could stop a later, otherwise-identical cycle from opening is the
+      // new drawdownHalted gate — proof by elimination that it's actually
+      // this code path doing the stopping, not a coincidental other veto.
+      const positions = await db
+        .selectFrom("paper_positions")
+        .selectAll()
+        .where("scenario_id", "=", result.scenarioId)
+        .orderBy("opened_at", "asc")
+        .execute();
+      for (const p of positions) {
+        expect(p.exit_reasoning).toContain("reasonCode=BASIS_DIVERGED");
+      }
+    },
+  );
+
+  it(
+    "threads THIS scenario's own closed-trade history into computeNextPositionSizeFraction across THREE sequential " +
       "trades in one live run — every other fixture in this file only ever closes its single position via the " +
       "post-loop SCENARIO_END path, so computeNextPositionSizeFraction is never called here with anything but an " +
       "empty closedTradeHistory; adaptivePositionSizing.test.ts's own unit tests already prove the pure function " +
       "is correct in isolation, but never touch scenarioRunner.ts's own construction/threading of that history " +
-      "into a real pickBestCandidate -> evaluateCandidate -> targetNotional call",
+      "into a real pickBestCandidate -> evaluateCandidate -> targetNotional call. Uses a two-WIN streak (not a " +
+      "significant loss) to reach a non-default fraction: found 2026-08-08 that a single first-trade loss big " +
+      "enough to trip computeNextPositionSizeFraction's OWN 3%-of-equity step-down threshold is — for a scenario's " +
+      "very first trade — essentially the same ratio as risk/drawdown.ts's peak-relative 3% halt (both denominators " +
+      "are ~equityAtClose for trade #1), so the original loss-based fixture now correctly gets halted by the new " +
+      "drawdown check before a second trade can ever open; a win streak reaches the same 'non-default fraction' " +
+      "assertion without that now-real conflict.",
     async () => {
-      const symA = "__TEST_SCN_ADAPT_A__USDT";
-      const symB = "__TEST_SCN_ADAPT_B__USDT";
-      const t0 = new Date("2026-05-01T00:00:00.000Z");
-      const t1 = new Date("2026-05-01T01:00:00.000Z");
-      const t2 = new Date("2026-05-01T02:00:00.000Z");
-      const t3 = new Date("2026-05-01T03:00:00.000Z");
+      const sym = "__TEST_SCN_ADAPT_A__USDT";
+      const hour = (n: number) => new Date(new Date("2026-05-01T00:00:00.000Z").getTime() + n * 60 * 60 * 1000);
       const PRICE = "100";
       const RATE = "0.001"; // HIGH_RATE from the look-ahead fixture — comfortably clears every risk/index.ts gate
       const startingDeposit = new Big("500");
       const leverage = new Big("1");
       const nextFunding = (t: Date) => new Date(t.getTime() + 6 * 60 * 60 * 1000); // 6h out, outside FUNDING_SETTLEMENT_BLACKOUT
 
-      // --- Symbol A: opens at t0 with an EMPTY closedTradeHistory (this
-      // scenario's very first entry) -> NO_HISTORY_FRACTION (0.10). At t1 the
-      // perp mark price jumps 50% (100 -> 150) while spot stays put — basis
-      // divergence 0.50 >> exitRules.ts's 0.005 threshold, so checkExit
-      // force-closes it immediately via BASIS_DIVERGED (unconditional, no
-      // minimum-hold gate, unlike the funding-turned-negative/hysteresis
-      // reasons — same mechanism as the "closes a position via
-      // strategy/exitRules.ts's planned-exit path" fixture above, just a much
-      // bigger jump). 150 stays safely below this position's own ~196
-      // liquidation price (entryPrice*(1+1/leverage)/(1+MMR) = 100*2/1.02,
-      // FALLBACK_CONSERVATIVE_TIER's 2% MMR at leverage=1 — same formula the
-      // forced-liquidation fixture above documents), so FORCED_LIQUIDATION
-      // never preempts the basis check. The resulting loss is deliberately
-      // far past SIGNIFICANT_LOSS_THRESHOLD_PCT_OF_EQUITY (3%) so
-      // computeNextPositionSizeFraction's step-down branch is unambiguously
-      // the one exercised, not the "ordinary loss, no adjustment" branch.
-      await insertTickerPair(db, symA, t0, PRICE);
-      await insertDeepBook(db, symA, t0, PRICE);
-      await insertPredictedFunding(db, symA, t0, RATE, nextFunding(t0));
-      const exitPerpPriceA = new Big("150");
-      await db
-        .insertInto("tickers")
-        .values([
-          {
-            symbol: symA,
-            category: "linear",
-            last_price: exitPerpPriceA.toString(),
-            mark_price: exitPerpPriceA.toString(),
-            index_price: exitPerpPriceA.toString(),
-            volume_24h: null,
-            turnover_24h: GENEROUS_TURNOVER,
-            fetched_at: t1,
-          },
-          {
-            symbol: symA,
-            category: "spot",
-            last_price: PRICE,
-            mark_price: null,
-            index_price: null,
-            volume_24h: null,
-            turnover_24h: GENEROUS_TURNOVER,
-            fetched_at: t1,
-          },
-        ])
-        .execute();
+      // Trades 1 and 2: identical shape, each a WIN — perp mark drops 5%
+      // (100 -> 95) while spot stays flat, so the SHORT perp leg profits
+      // (bought back cheaper) with nothing on the spot leg to offset it.
+      // Basis divergence |95-100|/100 = 0.05 >> exitRules.ts's 0.005
+      // BASIS_DIVERGED threshold, so each closes cleanly and immediately —
+      // same close mechanism as the loss-based version this replaced, just
+      // the opposite price direction. A single isolated win never moves
+      // computeNextPositionSizeFraction on its own (`isWin && previousIsWin`
+      // needs a PRECEDING win too) — trade 2 is what actually triggers the
+      // step-up, evaluated with history=[trade1], since trade1 IS the
+      // "previous" trade at that point.
+      async function openWinningTrade(tOpen: Date, tClose: Date): Promise<Big> {
+        await insertTickerPair(db, sym, tOpen, PRICE);
+        await insertDeepBook(db, sym, tOpen, PRICE);
+        await insertPredictedFunding(db, sym, tOpen, RATE, nextFunding(tOpen));
+        const exitPerpPrice = new Big("95");
+        await db
+          .insertInto("tickers")
+          .values([
+            {
+              symbol: sym,
+              category: "linear",
+              last_price: exitPerpPrice.toString(),
+              mark_price: exitPerpPrice.toString(),
+              index_price: exitPerpPrice.toString(),
+              volume_24h: null,
+              turnover_24h: GENEROUS_TURNOVER,
+              fetched_at: tClose,
+            },
+            {
+              symbol: sym,
+              category: "spot",
+              last_price: PRICE,
+              mark_price: null,
+              index_price: null,
+              volume_24h: null,
+              turnover_24h: GENEROUS_TURNOVER,
+              fetched_at: tClose,
+            },
+          ])
+          .execute();
+        return exitPerpPrice;
+      }
 
-      // --- Symbol B: deliberately carries NO data at all until t2 — it
-      // cannot possibly qualify before A's trade has already closed and been
-      // pushed onto closedTradeHistory. This is what forces B's own entry
-      // sizing decision to run with a NONEMPTY history, the exact gap this
-      // test exists to close.
-      await insertTickerPair(db, symB, t2, PRICE);
-      await insertTickerPair(db, symB, t3, PRICE); // flat basis through range end -> SCENARIO_END close, not a premature exit
-      await insertDeepBook(db, symB, t2, PRICE);
-      await insertPredictedFunding(db, symB, t2, RATE, nextFunding(t2));
+      const exitPerpPrice1 = await openWinningTrade(hour(0), hour(1));
+      const exitPerpPrice2 = await openWinningTrade(hour(2), hour(3));
+
+      // Trade 3 (under test): fresh flat entry, held flat through range end
+      // -> SCENARIO_END close, same variety as the original design.
+      await insertTickerPair(db, sym, hour(4), PRICE);
+      await insertDeepBook(db, sym, hour(4), PRICE);
+      await insertPredictedFunding(db, sym, hour(4), RATE, nextFunding(hour(4)));
+      await insertTickerPair(db, sym, hour(5), PRICE); // flat through range end
 
       const result = await runScenario(db, {
         name: "__test_adaptive_sizing_threading__",
         leverage,
         startingDeposit,
-        symbols: [symA, symB],
-        startAt: t0,
-        endAt: t3,
+        symbols: [sym],
+        startAt: hour(0),
+        endAt: hour(5),
       });
       scenarioIdsToClean.push(result.scenarioId);
 
-      expect(result.ticksProcessed).toBe(4);
-      expect(result.positionsOpened).toBe(2);
-      expect(result.positionsClosed).toBe(2);
+      expect(result.ticksProcessed).toBe(6);
+      expect(result.positionsOpened).toBe(3);
+      expect(result.positionsClosed).toBe(3);
 
       const positions = await db
         .selectFrom("paper_positions")
@@ -640,95 +771,116 @@ describe("runScenario", () => {
         .where("scenario_id", "=", result.scenarioId)
         .orderBy("opened_at", "asc")
         .execute();
-      expect(positions).toHaveLength(2);
-      const posA = positions[0]!;
-      const posB = positions[1]!;
-      expect(posA.symbol).toBe(symA);
-      expect(posB.symbol).toBe(symB);
-      expect(posA.exit_reasoning).toContain("reasonCode=BASIS_DIVERGED");
-      expect(posB.exit_reasoning).toContain("reasonCode=SCENARIO_END");
+      expect(positions).toHaveLength(3);
+      const [pos1, pos2, pos3] = positions as [(typeof positions)[0], (typeof positions)[0], (typeof positions)[0]];
+      expect(pos1.exit_reasoning).toContain("reasonCode=BASIS_DIVERGED");
+      expect(pos2.exit_reasoning).toContain("reasonCode=BASIS_DIVERGED");
+      expect(pos3.exit_reasoning).toContain("reasonCode=SCENARIO_END");
 
       // --- Trade 1's own actual size: empty history -> NO_HISTORY_FRACTION.
-      const perpQtyA = new Big(posA.perp_qty!);
-      const spotQtyA = new Big(posA.spot_qty!);
-      expect(perpQtyA.toString()).toBe(spotQtyA.toString()); // RSK-07/08, 1:1
-      const expectedSizingA = sizePosition({
+      const perpQty1 = new Big(pos1.perp_qty!);
+      const spotQty1 = new Big(pos1.spot_qty!);
+      expect(perpQty1.toString()).toBe(spotQty1.toString()); // RSK-07/08, 1:1
+      const expectedSizing1 = sizePosition({
         targetNotional: startingDeposit.times(NO_HISTORY_FRACTION),
         markPrice: new Big(PRICE),
         perpQtyStep: DEFAULT_PERP_QTY_STEP,
       });
-      if (!expectedSizingA.allowed) throw new Error("fixture bug: symbol A's own entry should be allowed");
-      expect(perpQtyA.toString()).toBe(expectedSizingA.perpQty.toString());
+      if (!expectedSizing1.allowed) throw new Error("fixture bug: trade 1's own entry should be allowed");
+      expect(perpQty1.toString()).toBe(expectedSizing1.perpQty.toString());
 
-      // --- Independently reconstruct trade 1's realized outcome using the
+      // --- Independently reconstruct each trade's realized outcome using the
       // SAME shared pure function scenarioRunner.ts's own closePosition calls
       // (execution/realizedPnl.ts's computeRealizedPnl), fed only with this
       // fixture's own controlled inputs — not a hand-typed dollar figure.
-      const initialCapitalA = spotQtyA.times(PRICE).plus(perpQtyA.times(PRICE).div(leverage));
-      const cashOutsideAfterOpenA = startingDeposit.minus(initialCapitalA);
-      const entryFeesA = spotQtyA
-        .times(PRICE)
-        .times(SPOT_TAKER_FEE_RATE_FALLBACK)
-        .plus(perpQtyA.times(PRICE).times(PERP_TAKER_FEE_RATE_FALLBACK));
-      const exitFeesA = spotQtyA
-        .times(PRICE)
-        .times(SPOT_TAKER_FEE_RATE_FALLBACK)
-        .plus(perpQtyA.times(exitPerpPriceA).times(PERP_TAKER_FEE_RATE_FALLBACK));
-      const realizedPnlA = computeRealizedPnl({
-        entryLegNotional: spotQtyA.times(PRICE),
-        exitLegNotional: spotQtyA.times(PRICE), // spot price unchanged in this fixture
-        entryBasis: new Big(0), // perp == spot at A's own entry
-        exitBasis: exitPerpPriceA.minus(new Big(PRICE)).div(PRICE),
-        grossFundingCollected: new Big(0), // no settled funding row inserted for A
-        totalFees: entryFeesA.plus(exitFeesA),
-        realizedSlippage: new Big(0), // DEEP_BOOK_QTY keeps slippageBp exactly 0
-      });
-      // leverage=1 -> accrueBorrowCost's rate is algebraically exactly 0 (borrowCost.ts's own doc comment).
-      const cashReturnedA = initialCapitalA.plus(realizedPnlA);
-      const equityAtCloseA = cashOutsideAfterOpenA.plus(cashReturnedA);
+      function reconstructOutcome(perpQty: Big, spotQty: Big, exitPerpPrice: Big, precedingCashOutside: Big) {
+        const initialCapital = spotQty.times(PRICE).plus(perpQty.times(PRICE).div(leverage));
+        const cashOutsideAfterOpen = precedingCashOutside.minus(initialCapital);
+        const entryFees = spotQty
+          .times(PRICE)
+          .times(SPOT_TAKER_FEE_RATE_FALLBACK)
+          .plus(perpQty.times(PRICE).times(PERP_TAKER_FEE_RATE_FALLBACK));
+        const exitFees = spotQty
+          .times(PRICE)
+          .times(SPOT_TAKER_FEE_RATE_FALLBACK)
+          .plus(perpQty.times(exitPerpPrice).times(PERP_TAKER_FEE_RATE_FALLBACK));
+        const realizedPnl = computeRealizedPnl({
+          entryLegNotional: spotQty.times(PRICE),
+          exitLegNotional: spotQty.times(PRICE), // spot price unchanged in this fixture
+          entryBasis: new Big(0), // perp == spot at entry
+          exitBasis: exitPerpPrice.minus(new Big(PRICE)).div(PRICE),
+          grossFundingCollected: new Big(0), // no settled funding row inserted
+          totalFees: entryFees.plus(exitFees),
+          realizedSlippage: new Big(0), // DEEP_BOOK_QTY keeps slippageBp exactly 0
+        });
+        // leverage=1 -> accrueBorrowCost's rate is algebraically exactly 0 (borrowCost.ts's own doc comment).
+        const cashReturned = initialCapital.plus(realizedPnl);
+        const equityAtClose = cashOutsideAfterOpen.plus(cashReturned);
+        return { realizedPnl, equityAtClose, cashOutsideAfterClose: cashOutsideAfterOpen.plus(cashReturned) };
+      }
 
-      // Sanity: this fixture really does produce a "significant" loss (past
-      // SIGNIFICANT_LOSS_THRESHOLD_PCT_OF_EQUITY), the branch of
-      // computeNextPositionSizeFraction this test exercises end-to-end.
-      expect(realizedPnlA.lt(0)).toBe(true);
-      expect(realizedPnlA.div(equityAtCloseA).lt(SIGNIFICANT_LOSS_THRESHOLD_PCT_OF_EQUITY.times(-1))).toBe(true);
+      const outcome1 = reconstructOutcome(perpQty1, spotQty1, exitPerpPrice1, startingDeposit);
+      // Sanity: trade 1 really is a win, not accidentally a loss/breakeven.
+      expect(outcome1.realizedPnl.gt(0)).toBe(true);
 
-      const expectedSizeFractionForB = computeNextPositionSizeFraction([
-        { realizedPnl: realizedPnlA, equityAtClose: equityAtCloseA },
+      // --- Trade 2's own size: history=[trade1] is a single isolated win
+      // (no PRECEDING win to pair it with) -> no adjustment, still
+      // NO_HISTORY_FRACTION. Confirms the "single win, no streak yet" branch
+      // specifically, distinct from trade 3's actual step-up below.
+      const expectedFractionFor2 = computeNextPositionSizeFraction([
+        { realizedPnl: outcome1.realizedPnl, equityAtClose: outcome1.equityAtClose },
       ]);
-      expect(expectedSizeFractionForB.toString()).toBe("0.05"); // NO_HISTORY_FRACTION - STEP, floored at MIN_FRACTION (same value here)
-
-      // --- THE CORE ASSERTION: symbol B's own persisted size must match what
-      // pickBestCandidate/evaluateCandidate actually computed from THIS exact
-      // fraction against THIS exact post-loss equity — not
-      // NO_HISTORY_FRACTION (0.10) again, which is what a scenarioRunner.ts
-      // regression silently dropping/mis-threading closedTradeHistory (wrong
-      // sign at line ~1028, stale array, or never actually passed into
-      // computeNextPositionSizeFraction) would produce instead.
-      const expectedTargetNotionalB = equityAtCloseA.times(expectedSizeFractionForB);
-      const expectedSizingB = sizePosition({
-        targetNotional: expectedTargetNotionalB,
+      expect(expectedFractionFor2.toString()).toBe(NO_HISTORY_FRACTION.toString());
+      const perpQty2 = new Big(pos2.perp_qty!);
+      const spotQty2 = new Big(pos2.spot_qty!);
+      const expectedSizing2 = sizePosition({
+        targetNotional: outcome1.equityAtClose.times(expectedFractionFor2),
         markPrice: new Big(PRICE),
         perpQtyStep: DEFAULT_PERP_QTY_STEP,
       });
-      if (!expectedSizingB.allowed) throw new Error("fixture bug: symbol B's own entry should be allowed");
+      if (!expectedSizing2.allowed) throw new Error("fixture bug: trade 2's own entry should be allowed");
+      expect(perpQty2.toString()).toBe(expectedSizing2.perpQty.toString());
 
-      const perpQtyB = new Big(posB.perp_qty!);
-      const spotQtyB = new Big(posB.spot_qty!);
-      expect(perpQtyB.toString()).toBe(spotQtyB.toString());
-      expect(perpQtyB.toString()).toBe(expectedSizingB.perpQty.toString());
+      const outcome2 = reconstructOutcome(perpQty2, spotQty2, exitPerpPrice2, outcome1.cashOutsideAfterClose);
+      expect(outcome2.realizedPnl.gt(0)).toBe(true);
 
-      // Redundant-but-explicit: prove it is actually HALF of what the
+      // --- THE CORE ASSERTION: trade 3's own persisted size must match what
+      // pickBestCandidate/evaluateCandidate actually computed from a TWO-WIN
+      // streak — NO_HISTORY_FRACTION + STEP = 0.15, not NO_HISTORY_FRACTION
+      // (0.10) again, which is what a scenarioRunner.ts regression silently
+      // dropping/mis-threading closedTradeHistory (stale array, wrong order,
+      // or never actually passed into computeNextPositionSizeFraction) would
+      // produce instead.
+      const expectedFractionFor3 = computeNextPositionSizeFraction([
+        { realizedPnl: outcome1.realizedPnl, equityAtClose: outcome1.equityAtClose },
+        { realizedPnl: outcome2.realizedPnl, equityAtClose: outcome2.equityAtClose },
+      ]);
+      expect(expectedFractionFor3.toString()).toBe("0.15"); // NO_HISTORY_FRACTION + STEP, two-win streak
+
+      const expectedTargetNotional3 = outcome2.equityAtClose.times(expectedFractionFor3);
+      const expectedSizing3 = sizePosition({
+        targetNotional: expectedTargetNotional3,
+        markPrice: new Big(PRICE),
+        perpQtyStep: DEFAULT_PERP_QTY_STEP,
+      });
+      if (!expectedSizing3.allowed) throw new Error("fixture bug: trade 3's own entry should be allowed");
+
+      const perpQty3 = new Big(pos3.perp_qty!);
+      const spotQty3 = new Big(pos3.spot_qty!);
+      expect(perpQty3.toString()).toBe(spotQty3.toString());
+      expect(perpQty3.toString()).toBe(expectedSizing3.perpQty.toString());
+
+      // Redundant-but-explicit: prove it is actually LARGER than what the
       // (buggy, "history silently stayed empty") NO_HISTORY_FRACTION path
       // would have sized — the concrete, human-checkable number a wiring
       // regression would flip.
       const wronglySizedIfHistoryDropped = sizePosition({
-        targetNotional: equityAtCloseA.times(NO_HISTORY_FRACTION),
+        targetNotional: outcome2.equityAtClose.times(NO_HISTORY_FRACTION),
         markPrice: new Big(PRICE),
         perpQtyStep: DEFAULT_PERP_QTY_STEP,
       });
       if (!wronglySizedIfHistoryDropped.allowed) throw new Error("fixture bug");
-      expect(perpQtyB.toString()).not.toBe(wronglySizedIfHistoryDropped.perpQty.toString());
+      expect(perpQty3.toString()).not.toBe(wronglySizedIfHistoryDropped.perpQty.toString());
     },
   );
 });
