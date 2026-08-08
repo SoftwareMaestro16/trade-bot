@@ -18,24 +18,24 @@
 │  market-data     │             │   флаг, отдельный  │
 │  strategy        │             │   systemd unit)    │
 │  risk            │             └──────────┬────────┘
-│  execution       │                        │ пишет command
-│  reconciliation  │                        │ читает heartbeat
-└────────┬─────────┘                        │
-         │ heartbeat раз в минуту            │
-         ▼                                   ▼
-┌──────────────────┐              (свои ключи Bybit:
-│  watchdog          │              Trade+Read, для
-│  (внешний хост,     │              принудительного
-│  НЕ этот VPS)       │              закрытия, если
-│  RR-35, RR-37       │              trader не ACK'ит
-└──────────────────┘              команду за N секунд)
+│  execution       │                        │ пишет HALT_NEW/
+│  reconciliation  │                        │ FLATTEN_ALL в БД,
+└────────┬─────────┘                        │ алертит в Telegram
+         │ heartbeat раз в 5 минут           │ (НЕТ доступа к бирже —
+         ▼                                   │  см. ниже)
+┌──────────────────┐                         ▼
+│  healthchecks.io  │              [NOT YET BUILT]: собственный
+│  (сторонний        │              ключ Bybit Trade+Read и
+│  пинг-сервис, см.   │              принудительное закрытие,
+│  §1 текст ниже)     │              если trader не ACK'ит
+└──────────────────┘              команду за N секунд (RR-37)
 ```
 
 **trader** — основной цикл: сбор данных → стратегия → риск-вето → исполнение → сверка. Единственный процесс, который открывает и закрывает позиции в штатном режиме.
 
-**killswitch-listener** — отдельный OS-процесс (systemd unit, `Restart=always`). Слушает Telegram и файл-флаг. Не содержит бизнес-логики стратегии. Имеет собственный доступ к Bybit (тот же ключ, права Trade+Read) — это осознанное решение: если это свойство не выполнено, RR-37 (супервизор закрывает позиции, если trader не подтвердил за N секунд) физически нереализуемо, потому что supervisor не сможет отправить ордер на закрытие без доступа к бирже.
+**killswitch-listener** — отдельный OS-процесс (systemd unit, `Restart=always`). Слушает Telegram и файл-флаг. Не содержит бизнес-логики стратегии. **Сегодня** может только поднять/снять `HALT_NEW`/`FLATTEN_ALL` и сделать это durable и наблюдаемым (БД + файл-флаг + Telegram) — доступа к бирже у него нет вообще: нет ни Trade-ключа, ни какого-либо кода размещения ордеров (`src/killswitch-listener.ts`'s own doc comment: «It cannot yet actually flatten anything on the exchange — there is no execution/ order placement wired up, no Trade-permission key»). Собственный ключ Bybit Trade+Read для принудительного закрытия позиций, которого требует RR-37 (супервизор закрывает позиции, если trader не подтвердил за N секунд), — это **NOT YET BUILT**, будущая работа: без него RR-37 физически нереализуем, потому что supervisor не может отправить ордер на закрытие без доступа к бирже. Пока это построено, единственный способ фактически закрыть голую ногу — ручное вмешательство оператора после алерта.
 
-**watchdog** — на **другом** хосте (RR-35 требует независимости отказов). Получает heartbeat, при отсутствии дольше 5 минут шлёт алерт через отдельный Telegram-бот с отдельным токеном (RR-36). Не имеет доступа к Bybit — это чистый наблюдатель, а не исполнитель. Исполнитель последней инстанции — killswitch-listener на основном VPS, потому что у него есть ключ; watchdog просто гарантирует, что человек узнает, если и trader, и killswitch-listener замолчали одновременно (то есть упал весь VPS).
+**Внешний heartbeat** — не отдельный watchdog-процесс на отдельном хосте, а пинг стороннего сервиса (например healthchecks.io) через `HEALTHCHECK_PING_URL`: `src/collector.ts` каждые `HEARTBEAT_INTERVAL_MS` (5 минут) вызывает `src/notify/healthcheck.ts`'s `startHeartbeat`, который пингует URL, только если все проверки свежести данных из `src/collector/heartbeatChecks.ts` (`buildFreshnessChecks`) проходят — если что-то протухло, пинг сознательно не отправляется. Алертинг при отсутствии пинга (email/интеграции стороннего сервиса) внешний по отношению к этой кодовой базе — отдельного Telegram-бота или второго токена для этого нет: `src/config/env.ts` определяет только один `TELEGRAM_BOT_TOKEN`, общий для `collector.ts` и `killswitch-listener.ts`. `src/watchdog/` — пустая директория: отдельный процесс на отдельном хосте с собственным Telegram-ботом/токеном, независимо алертящий после 5 минут тишины (изначальный design intent RR-35/RR-36), сегодня не существует и остаётся будущей фазой, а не построенным компонентом.
 
 Разделение trader / killswitch-listener решает конкретный сценарий из RR-31: цикл завис на `await` без таймаута (классическая причина — забытый таймаут на сокете). `trader` не реагирует ни на что. `killswitch-listener` — отдельный процесс с отдельным event loop — продолжает получать команды и, не дождавшись подтверждения от `trader` за N секунд, закрывает позиции сам.
 
@@ -45,8 +45,12 @@
 
 ```
 config/          конфигурация, схема-валидация при старте (zod), отказ стартовать при OPEN-параметре без значения
-exchange/        единственная точка входа в bybit-api. Нормализация ошибок, throwExceptions+retCode-проверка,
-                 rate limiter, backoff с джиттером и потолком, таймауты, схема-валидация WS-сообщений
+exchange/        основная точка входа в bybit-api (два документированных lint-исключения: market-data/
+                 collectLiquidations.ts и market-data/parseLiquidationEvent.ts — WS-клиент и его event-shape
+                 guard, см. eslint.config.js/ADR-002). Нормализация ошибок, throwExceptions+retCode-проверка,
+                 rate limiter (фиксированный минимальный интервал между вызовами, БЕЗ джиттера и БЕЗ потолка —
+                 см. exchange/rateLimiter.ts's own doc comment), таймауты. Никакого WS-клиента здесь нет;
+                 схема-валидация WS-сообщений — ручной type guard в market-data/parseLiquidationEvent.ts
 market-data/     приём и запись funding/цен/OI/long-short/ликвидаций, снимки стакана
 strategy/        чистые функции: вход данные → решение. Без побочных эффектов, без доступа к execution/
 risk/            все проверки перед действием, право вето. Единственный модуль, который может сказать «нет»
@@ -59,10 +63,13 @@ reconciliation/  периодическая сверка локального с
                  реального аутентифицированного клиента биржи для запроса ExchangeSnapshot/
                  ExchangePerpHolding ещё не существует (см. таблицу переходов §4 и статусы реализации
                  обоих файлов там же)
-killswitch/      общая логика уровней (используется и trader, и killswitch-listener), не сам процесс
+killswitch/      общая логика уровней, не сам процесс. Сегодня реально используется только killswitch-listener —
+                 collector.ts (trader) не импортирует ничего из killswitch/ и halt_state не проверяет: trader
+                 сегодня НЕ halt-aware (подключение — будущая работа)
 storage/         Kysely-клиент, миграции, репозитории по агрегатам
-notify/          Telegram: алерты, суточная сводка
-watchdog/        код heartbeat-клиента внутри trader; сам watchdog-процесс — отдельный деплой (см. §1)
+notify/          Telegram: алерты, суточная сводка; здесь же healthcheck.ts (внешний heartbeat-пинг, см. §1)
+watchdog/        пустая директория, ничего не реализовано (см. §1). Реальная heartbeat-логика живёт в
+                 collector/heartbeatChecks.ts (buildFreshnessChecks) и notify/healthcheck.ts (startHeartbeat)
 emulation/       Фаза 2 paper-trading: scenarioRunner (replay реальных данных с look-ahead дисциплиной, см. его
                  собственный doc comment), reportGenerator, liquidation, borrowCost, equityEngine,
                  adaptivePositionSizing — читает исторические данные market-data/, никогда не вызывает exchange/
@@ -114,12 +121,15 @@ funding_payments (                    -- append-only, FR-308
   interval_start, interval_end
 )
 
-reconciliation_log (
-  id, checked_at, mismatch_type, expected jsonb, actual jsonb, resolution
-)
+-- reconciliation_log — PLANNED, не смигрирована: checkInvariants.ts's InvariantViolation
+-- тип нигде пока не персистируется. Нет ни в одной миграции, ни в storage/schema.ts's
+-- Database interface. Форма ниже — design intent, не факт:
+-- reconciliation_log (
+--   id, checked_at, mismatch_type, expected jsonb, actual jsonb, resolution
+-- )
 
 risk_vetoes (                         -- FR-307
-  id, at, intent jsonb, reason, threshold_value numeric, actual_value numeric
+  id, at, intent jsonb, veto_code text, veto_reason text, threshold_value numeric, actual_value numeric
 )
 
 equity_snapshots (
@@ -127,7 +137,7 @@ equity_snapshots (
 )
 
 -- Фаза 1, TimescaleDB hypertables
-funding_rates, tickers, orderbook_snapshots, open_interest, long_short_ratio, liquidations
+funding_rates, tickers, orderbook_levels, open_interest, long_short_ratio, liquidations
 ```
 
 ---
@@ -214,7 +224,7 @@ stateDiagram-v2
 | `LEG1_OPEN → LEG2_SENT` | Отправка заявки на спот | То же семейство отказов, что и для ноги 1 | Симметрично LEG1, но с одним отличием: любой финальный отказ второй ноги ведёт не в `IDLE`, а в `UNWINDING_LEG1` — RR-10 |
 | `LEG2_SENT → UNWINDING_LEG1` | Вторая нога отклонена, не довыполнена или подтверждённо не существует после `LEG2_UNKNOWN` | **Это ровно тот сценарий, ради которого написан весь модуль execution/.** Шорт открыт, спота нет — голая направленная позиция | Немедленная рыночная заявка на закрытие шорта. Не ждать следующего цикла, не запрашивать риск заново — RR-10 безусловен |
 | `UNWINDING_LEG1 → UNWIND_UNKNOWN` | Таймаут при закрытии первой ноги | Худший момент: неизвестно, закрылась ли уже сама наименее желательная позиция — голый шорт | Тот же протокол проверки по `orderLinkId`, но с сокращённым интервалом ретраев и эскалацией приоритета — открытая голая нога это RR-14, «маржа шорта ниже порога» может сработать параллельно и это нормально, реакции не конфликтуют, обе ведут к закрытию |
-| `UNWINDING_LEG1 → STUCK_LEG` | N попыток закрытия не увенчались успехом (биржа недоступна, повторные отказы) | Бот не может закрыть голую ногу собственными силами | Kill switch уровня 1 эскалируется автоматически: алерт с maximum priority, дальше — ручное вмешательство. Механическое закрытие через `killswitch-listener` (у него свой доступ к бирже — иногда сбой специфичен для сессии/клиента `trader`, а не для биржи в целом) |
+| `UNWINDING_LEG1 → STUCK_LEG` | N попыток закрытия не увенчались успехом (биржа недоступна, повторные отказы) | Бот не может закрыть голую ногу собственными силами | Kill switch уровня 1 эскалируется автоматически: алерт с maximum priority, дальше — ручное вмешательство оператора обязательно **сегодня** — `killswitch-listener` не имеет доступа к бирже (нет Trade-ключа, нет кода размещения ордеров), автоматическое механическое закрытие через него — NOT YET BUILT (см. §1) |
 | `OPEN → DEGRADED` | Плановая сверка (`reconciliation/`) не совпала с ожиданием | Позиция на бирже меньше/больше/отсутствует относительно локального состояния | Различить: (а) объясняется штатным fill/funding событием, которое ещё не долетело — подождать один цикл; (б) не объясняется — это либо ADL (FR-305), либо рассинхрон другого рода. Оба случая **не закрываются вслепую** — RR-14 требует сверки перед действием, а действовать без понимания причины и есть слепое закрытие |
 | `DEGRADED → STUCK_LEG` | Расхождение не объяснилось за K циклов сверки | Бот не понимает своё состояние | Заморозка, алерт с полным дампом сравнения локальное/биржевое, решение за владельцем — это единственная разумная реакция, когда биржа — источник истины, а источник истины противоречит журналу |
 | `OPEN → FROZEN` | risk/ триггер level-2 "заморозка": рассинхрон, M ошибок API подряд, потеря WS дольше T | Позиция жива и, предположительно, в порядке, но зрение или связь бота под вопросом | Не трогать позицию. Переключиться на REST-поллинг при потере WS. Дождаться либо восстановления канала, либо явного /resume. Автоматические защитные триггеры (маржа, просадка) продолжают действовать параллельно — freeze не означает "риск/ выключен", freeze означает "новые входы и слепые действия запрещены" |
