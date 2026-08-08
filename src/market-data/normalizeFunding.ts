@@ -9,7 +9,11 @@ import Big from "big.js";
  * symbol happens to settle more often.
  */
 
-const REFERENCE_INTERVAL_MINUTES = 480; // the canonical "r8h" basis
+// The canonical "r8h" basis — exported so any caller computing "how many r8h
+// periods fit in a window of T minutes" (T / REFERENCE_INTERVAL_MINUTES) uses
+// the SAME constant this function normalizes against, rather than a symbol's
+// own (irrelevant, once already normalized to r8h) intervalMinutes.
+export const REFERENCE_INTERVAL_MINUTES = 480;
 const HOURS_PER_YEAR = 24 * 365;
 const MINUTES_PER_HOUR = 60;
 

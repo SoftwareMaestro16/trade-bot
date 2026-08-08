@@ -6,7 +6,7 @@ import { estimateSlippage } from "../../risk/liquidity.js";
 import { computeTotalRoundTripCost } from "../../risk/totalRoundTripCost.js";
 import { rankCandidates, computeCandidateYield } from "../../strategy/rankCandidates.js";
 import { sizePosition } from "../../strategy/sizing.js";
-import { normalizeFundingRateToR8h } from "../../market-data/normalizeFunding.js";
+import { normalizeFundingRateToR8h, REFERENCE_INTERVAL_MINUTES } from "../../market-data/normalizeFunding.js";
 import { latestLongShortRatioAtOrBefore } from "../../market-data/collectLongShortRatio.js";
 import { computeBorrowCost8h } from "../borrowCost.js";
 import { computeMaintenanceMargin, lookupMarginTier } from "../liquidation.js";
@@ -88,7 +88,23 @@ async function evaluateCandidate(
     resolved.hourlyBorrowRate,
   );
 
-  const expectedHoldIntervals = EXPECTED_PAYBACK_MINUTES.div(predicted.intervalMinutes);
+  // BUG FOUND 2026-08-07 (workflow audit): this used to divide by
+  // predicted.intervalMinutes (the symbol's own RAW settlement cadence)
+  // instead of REFERENCE_INTERVAL_MINUTES (480, the basis r8h is already
+  // normalized to). r8h is a per-8h rate regardless of the symbol's own
+  // interval — mixing it with a raw-interval-based period count silently
+  // inflated expectedGross below (r8h.times(expectedHoldIntervals) in
+  // risk/economics.ts's checkEntryThreshold) by exactly
+  // 480/intervalMinutes: 2x for the 240min symbols that are the bulk of the
+  // universe, 8x for 60min symbols — collapsing the intended K=2.0 gross
+  // margin down to an effective 1.0x (zero margin) or 0.25x (admits entries
+  // whose true expected income doesn't even cover round-trip fees) for
+  // exactly those symbols. Correct: T minutes / 480 minutes-per-r8h-period is
+  // a CONSTANT (9 for the 3-day EXPECTED_PAYBACK_MINUTES window) independent
+  // of intervalMinutes — verified against PARAMS-CONSERVATIVE.md §5's own
+  // worked example (the 4h-symbol raw threshold is exactly half the 8h-symbol
+  // raw threshold, i.e. identical once normalized to r8h).
+  const expectedHoldIntervals = EXPECTED_PAYBACK_MINUTES.div(REFERENCE_INTERVAL_MINUTES);
 
   const projectedShortNotional = sized.perpQty.times(perpMarkPrice);
   const projectedSpotLegNotional = sized.spotQty.times(spotPrice);

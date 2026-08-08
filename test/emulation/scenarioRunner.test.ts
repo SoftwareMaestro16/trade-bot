@@ -27,6 +27,7 @@ import type { Database } from "../../src/storage/schema.js";
 
 const ALL_TEST_SYMBOLS = [
   "__TEST_SCN_LOOKAHEAD__USDT",
+  "__TEST_SCN_INTERVAL240__USDT",
   "__TEST_SCN_MULTIA__USDT",
   "__TEST_SCN_MULTIB__USDT",
   "__TEST_SCN_MULTIC__USDT",
@@ -88,6 +89,7 @@ async function insertPredictedFunding(
   fetchedAt: Date,
   rate: string,
   nextFundingAt: Date,
+  intervalMinutes = 480,
 ): Promise<void> {
   await db
     .insertInto("funding_rates")
@@ -95,7 +97,7 @@ async function insertPredictedFunding(
       symbol,
       kind: "predicted",
       rate,
-      interval_minutes: 480,
+      interval_minutes: intervalMinutes,
       funding_timestamp_ms: String(nextFundingAt.getTime()),
       fetched_at: fetchedAt,
     })
@@ -280,6 +282,58 @@ describe("runScenario", () => {
       // above), so a regression that dropped the post-loop snapshot write would
       // silently pass a >=5 bound — pin the exact count instead.
       expect(snapshots.length).toBe(6);
+    },
+  );
+
+  it(
+    "denies entry on a 240-minute-interval symbol whose TRUE expected gross funding income (r8h normalized to the " +
+      "8h basis, held for the constant 9-period 3-day payback window) does not clear 2x round-trip cost — regression " +
+      "test for a bug (found 2026-08-07) where expectedHoldIntervals was computed from the symbol's own RAW " +
+      "intervalMinutes instead of the r8h reference basis (480min), inflating expectedGross 2x for every 240min " +
+      "symbol (the bulk of the live universe) and silently halving the intended K=2.0 safety margin",
+    async () => {
+      const symbol = "__TEST_SCN_INTERVAL240__USDT";
+      const t0 = new Date("2026-03-01T00:00:00.000Z");
+      const t1 = new Date("2026-03-01T01:00:00.000Z");
+      const PRICE = "100";
+      const nextFunding = new Date(t0.getTime() + 6 * 60 * 60 * 1000); // outside FUNDING_SETTLEMENT_BLACKOUT
+
+      // Raw 240min-interval rate chosen so r8h = rate * 480/240 = 0.0006 —
+      // comfortably above both ENTRY_FLOOR_R8H (0.0002) and the premium-driven
+      // gate (0.0005), isolating checkEntryThreshold's EXPECTED_GROSS_TOO_LOW
+      // as the only veto that can fire. With VIP0 fallback fees (spot 0.10% x2
+      // + perp 0.055% x2 = totalRoundTripCost 0.0031, zero slippage/basis in
+      // this fixture): correct expectedGross = r8h * 9 = 0.0054, which is
+      // BELOW 2*0.0031=0.0062 (correctly denied). The pre-fix bug would have
+      // computed expectedHoldIntervals = 4320/240 = 18 instead of the correct
+      // 4320/480 = 9, giving expectedGross = r8h * 18 = 0.0108 — WELL above
+      // 0.0062, wrongly allowing the entry.
+      const RATE = "0.0003";
+
+      await insertTickerPair(db, symbol, t0, PRICE);
+      await insertTickerPair(db, symbol, t1, PRICE);
+      await insertDeepBook(db, symbol, t0, PRICE);
+      await insertPredictedFunding(db, symbol, t0, RATE, nextFunding, 240);
+      await insertPredictedFunding(db, symbol, t1, RATE, nextFunding, 240);
+
+      const result = await runScenario(db, {
+        name: "__test_interval240__",
+        leverage: new Big("1"),
+        startingDeposit: new Big("500"),
+        symbols: [symbol],
+        startAt: t0,
+        endAt: t1,
+      });
+      scenarioIdsToClean.push(result.scenarioId);
+
+      expect(result.positionsOpened).toBe(0);
+
+      const positions = await db
+        .selectFrom("paper_positions")
+        .selectAll()
+        .where("scenario_id", "=", result.scenarioId)
+        .execute();
+      expect(positions).toHaveLength(0);
     },
   );
 
