@@ -7,6 +7,7 @@ import { generateReports } from "../emulation/reportGenerator.js";
 import { runScenario } from "../emulation/scenarioRunner.js";
 import type { ScenarioConfig } from "../emulation/scenarioRunner.js";
 import { createDb } from "../storage/db.js";
+import { sendDocument } from "../notify/telegram.js";
 
 /**
  * One-off, manually-run driver — NOT part of collector.ts's regular schedule.
@@ -81,6 +82,37 @@ export function buildLowCoverageCaveat(coverageHours: number, thresholdHours: nu
   );
 }
 
+/**
+ * Owner's ask (2026-08-09): the bot itself should hand over trade-level
+ * detail via Telegram (which pair, why it opened/closed, what's left of the
+ * deposit), not just a terminal log line only visible to whoever is watching
+ * this script run — see main()'s TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID gate.
+ * This is the caption text only; per-trade detail (symbol, entry/exit
+ * reason, P&L) lives in the attached paper_trades_<run_id>.csv itself,
+ * which is too granular to usefully summarize in a caption.
+ */
+export function buildTelegramCaption(
+  runId: string,
+  startingDeposit: Big,
+  finalEquity: Big,
+  positionsOpened: number,
+  positionsClosed: number,
+  coverageHours: number,
+  lowCoverageCaveat: string | null,
+): string {
+  const netPnl = finalEquity.minus(startingDeposit);
+  const netPnlPct = netPnl.div(startingDeposit).times(100);
+  return (
+    `📊 Эмуляция "${runId}"\n` +
+    `Депозит: $${startingDeposit.toFixed(2)} -> $${finalEquity.toFixed(2)} ` +
+    `(${netPnl.gte(0) ? "+" : ""}${netPnl.toFixed(2)} / ${netPnlPct.gte(0) ? "+" : ""}${netPnlPct.toFixed(2)}%)\n` +
+    `Сделок: ${String(positionsOpened)} открыто / ${String(positionsClosed)} закрыто\n` +
+    `Окно данных: ${coverageHours.toFixed(1)}ч` +
+    (lowCoverageCaveat !== null ? " (PRELIMINARY — ниже 168ч минимума)" : "") +
+    `\nПодробности по каждой сделке (пара, причина входа/выхода, P&L) — в приложенных файлах.`
+  );
+}
+
 async function main(): Promise<void> {
   const env = loadEnv();
   const db = createDb(env.DATABASE_URL);
@@ -150,6 +182,31 @@ async function main(): Promise<void> {
   await writeFile(tradesPath, reports.tradesCsv, "utf8");
   await writeFile(equityPath, reports.equityCurveCsv, "utf8");
   console.log(`[run-emulation] wrote:\n  ${summaryPath}\n  ${tradesPath}\n  ${equityPath}`);
+
+  // Optional — same "only wired up if both vars are set" gate collector.ts's
+  // own digest/heartbeat use (config/env.ts leaves both TELEGRAM_* fields
+  // optional). Owner's ask (2026-08-09): the bot itself should hand over the
+  // trade-level detail (which pair, why it opened/closed, what's left of the
+  // deposit), not just a terminal log line only visible to whoever is
+  // watching this script run.
+  if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID) {
+    const caption = buildTelegramCaption(
+      runId,
+      STARTING_DEPOSIT_USD,
+      result.finalEquity,
+      result.positionsOpened,
+      result.positionsClosed,
+      coverageHours,
+      lowCoverageCaveat,
+    );
+    const telegramConfig = { botToken: env.TELEGRAM_BOT_TOKEN, allowedChatId: env.TELEGRAM_CHAT_ID };
+    await sendDocument(telegramConfig, `paper_summary_${runId}.md`, reports.summaryMarkdown, { caption });
+    await sendDocument(telegramConfig, `paper_trades_${runId}.csv`, reports.tradesCsv);
+    await sendDocument(telegramConfig, `paper_equity_curve_${runId}.csv`, reports.equityCurveCsv);
+    console.log("[run-emulation] sent report files to Telegram");
+  } else {
+    console.log("[run-emulation] TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set — skipping Telegram delivery");
+  }
 
   await db.destroy();
 }

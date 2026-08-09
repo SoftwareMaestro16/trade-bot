@@ -1,6 +1,8 @@
+import Big from "big.js";
 import { describe, expect, it } from "vitest";
 import {
   buildLowCoverageCaveat,
+  buildTelegramCaption,
   computeCoverageHours,
   resolveObservedRange,
 } from "../../src/scripts/runEmulationScenario.js";
@@ -67,5 +69,40 @@ describe("buildLowCoverageCaveat", () => {
 
   it("stays silent (returns null) comfortably above the threshold", () => {
     expect(buildLowCoverageCaveat(thresholdHours * 2, thresholdHours)).toBeNull();
+  });
+});
+
+describe("buildTelegramCaption", () => {
+  it("reports a profit with an explicit + sign on both the dollar and percent figures", () => {
+    const caption = buildTelegramCaption("run-1", new Big("1000"), new Big("1050"), 3, 3, 200, null);
+    expect(caption).toContain("$1000.00 -> $1050.00");
+    expect(caption).toContain("(+50.00 / +5.00%)");
+    expect(caption).toContain("Сделок: 3 открыто / 3 закрыто");
+    expect(caption).not.toContain("PRELIMINARY");
+  });
+
+  it("reports a loss with an explicit - sign (Big.js's own toFixed doesn't add + but does add -)", () => {
+    const caption = buildTelegramCaption("run-2", new Big("1000"), new Big("950"), 5, 5, 200, null);
+    expect(caption).toContain("$1000.00 -> $950.00");
+    expect(caption).toContain("(-50.00 / -5.00%)");
+  });
+
+  it("surfaces the PRELIMINARY marker when a low-coverage caveat was produced, and includes the run id/coverage hours", () => {
+    const caveat = buildLowCoverageCaveat(24, 7 * 24);
+    const caption = buildTelegramCaption("preliminary-real-data-run-7", new Big("1000"), new Big("1000"), 0, 0, 24, caveat);
+    expect(caption).toContain('Эмуляция "preliminary-real-data-run-7"');
+    expect(caption).toContain("Окно данных: 24.0ч (PRELIMINARY — ниже 168ч минимума)");
+    expect(caption).toContain("Сделок: 0 открыто / 0 закрыто");
+  });
+
+  it("omits the PRELIMINARY marker once coverage clears the threshold, even though the caption doesn't recompute it itself", () => {
+    const caption = buildTelegramCaption("run-3", new Big("1000"), new Big("1000"), 1, 1, 200, null);
+    expect(caption).not.toContain("PRELIMINARY");
+    expect(caption).toContain("Окно данных: 200.0ч");
+  });
+
+  it("mentions that per-trade detail lives in the attached files, not the caption itself", () => {
+    const caption = buildTelegramCaption("run-4", new Big("1000"), new Big("1000"), 0, 0, 200, null);
+    expect(caption).toContain("приложенных файлах");
   });
 });
