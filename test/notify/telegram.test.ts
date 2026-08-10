@@ -6,6 +6,7 @@ import {
   editMessageText,
   sendAlert,
   sendDocument,
+  truncateCaption,
   sendRichMessage,
   TelegramApiError,
 } from "../../src/notify/telegram.js";
@@ -492,5 +493,32 @@ describe("authorizeCommand", () => {
   it("still authorizes text with no leading slash, parsing the first word as the command", async () => {
     const result = await authorizeCommand(alwaysAuthorized, { chatId: "-100123456", text: "hello world" });
     expect(result).toEqual({ authorized: true, chatId: "-100123456", command: "hello", args: ["world"] });
+  });
+});
+
+describe("truncateCaption — Telegram's 1024-char caption ceiling", () => {
+  it("leaves a caption that already fits completely untouched", () => {
+    expect(truncateCaption("short caption")).toBe("short caption");
+  });
+
+  it("keeps the result within the limit when the caption is too long", () => {
+    const long = "x".repeat(2000);
+    expect(truncateCaption(long).length).toBeLessThanOrEqual(1024);
+  });
+
+  it("cuts on a line boundary when one sits late enough in the budget", () => {
+    const caption = "a".repeat(900) + "\n" + "b".repeat(500);
+    const out = truncateCaption(caption);
+    expect(out).toBe("a".repeat(900) + "\n…");
+  });
+
+  it("falls back to a hard cut when the only newline is too early to be useful", () => {
+    const caption = "a".repeat(10) + "\n" + "b".repeat(2000);
+    const out = truncateCaption(caption);
+    expect(out.length).toBeLessThanOrEqual(1024);
+    expect(out.endsWith("\n…")).toBe(true);
+    // The early newline at index 10 must NOT have been used — that would discard
+    // ~99% of the budget to gain a tidy boundary.
+    expect(out.length).toBeGreaterThan(1000);
   });
 });

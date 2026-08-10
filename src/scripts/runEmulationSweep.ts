@@ -292,18 +292,28 @@ async function runOne(
   await writeFile(equityPath, reports.equityCurveCsv, "utf8");
 
   if (telegram) {
-    const caption = buildSweepCaption(
-      cfg,
-      runId,
-      result.finalEquity,
-      result.positionsOpened,
-      result.positionsClosed,
-      coverageHours,
-    );
-    await sendDocument(telegram, `paper_summary_${runId}.md`, reports.summaryMarkdown, { caption });
-    await sendDocument(telegram, `paper_trades_${runId}.csv`, reports.tradesCsv);
-    await sendDocument(telegram, `paper_equity_curve_${runId}.csv`, reports.equityCurveCsv);
-    console.log(`[sweep] ${cfg.key}: reports sent to Telegram`);
+    // Delivery is isolated from the result on purpose. An hour of computation
+    // is already complete and written to REPORTS_DIR by this point, so letting
+    // a Telegram-side failure propagate would discard a finished experiment
+    // over a transport problem — which is exactly what a 400 "caption is too
+    // long" did to this sweep's first config on 2026-08-10. The files stay on
+    // disk either way and can be re-sent by hand.
+    try {
+      const caption = buildSweepCaption(
+        cfg,
+        runId,
+        result.finalEquity,
+        result.positionsOpened,
+        result.positionsClosed,
+        coverageHours,
+      );
+      await sendDocument(telegram, `paper_summary_${runId}.md`, reports.summaryMarkdown, { caption });
+      await sendDocument(telegram, `paper_trades_${runId}.csv`, reports.tradesCsv);
+      await sendDocument(telegram, `paper_equity_curve_${runId}.csv`, reports.equityCurveCsv);
+      console.log(`[sweep] ${cfg.key}: reports sent to Telegram`);
+    } catch (e) {
+      console.error(`[sweep] ${cfg.key}: report DELIVERY failed (result is safe, files in ${REPORTS_DIR}):`, e);
+    }
   }
 
   return {

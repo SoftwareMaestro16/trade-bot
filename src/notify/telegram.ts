@@ -327,6 +327,32 @@ export interface SendDocumentOptions {
   caption?: string;
 }
 
+/**
+ * Bot API hard limit on `sendDocument`'s caption field. Exceeding it is a
+ * flat HTTP 400 ("message caption is too long") that loses the whole document,
+ * not just the caption — which is exactly how the 2026-08-10 sweep computed a
+ * config for an hour and then threw its report away at the last step.
+ */
+const MAX_CAPTION_CHARS = 1024;
+
+/**
+ * Truncates on a character budget rather than trusting callers to stay under
+ * it. A caption is an accompaniment to the file, so losing its tail is always
+ * preferable to losing the delivery: the file itself carries the full detail.
+ * Cuts at the last newline inside the budget when there is one, so the result
+ * ends on a whole line instead of mid-word.
+ */
+export function truncateCaption(caption: string, limit: number = MAX_CAPTION_CHARS): string {
+  if (caption.length <= limit) return caption;
+  const ellipsis = "\n…";
+  const budget = limit - ellipsis.length;
+  const head = caption.slice(0, budget);
+  const lastNewline = head.lastIndexOf("\n");
+  // Only prefer the line boundary if it does not throw away most of the budget.
+  const cut = lastNewline > budget * 0.5 ? head.slice(0, lastNewline) : head;
+  return cut + ellipsis;
+}
+
 /** Bot API's documented `sendDocument`-recognized file extensions this codebase actually produces reports as. */
 function inferDocumentMimeType(filename: string): string {
   if (filename.endsWith(".csv")) return "text/csv";
@@ -401,7 +427,7 @@ export async function sendDocument(
   form.append("chat_id", config.allowedChatId);
   form.append("document", new Blob([content], { type: inferDocumentMimeType(filename) }), filename);
   if (options?.caption) {
-    form.append("caption", options.caption);
+    form.append("caption", truncateCaption(options.caption));
   }
 
   // Same TELEGRAM_REQUEST_TIMEOUT_MS/AbortController treatment as
