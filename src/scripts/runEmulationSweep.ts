@@ -9,6 +9,7 @@ import type { ScenarioConfig } from "../emulation/scenarioRunner.js";
 import { createDb } from "../storage/db.js";
 import { sendDocument, sendAlert } from "../notify/telegram.js";
 import { resolveObservedRange, computeCoverageHours } from "./runEmulationScenario.js";
+import { notionalForCapital } from "../strategy/capitalAllocation.js";
 
 /**
  * One-off, manually-run parameter sweep — NOT part of collector.ts's schedule,
@@ -60,6 +61,19 @@ const MINUTES_PER_SETTLEMENT = 480; // r8h basis, market-data/normalizeFunding.t
  */
 const DEADLINE_ISO = process.env.SWEEP_DEADLINE_ISO ?? "2026-08-11T12:00:00Z";
 
+/**
+ * Comma-separated config keys to skip, e.g. after extending SWEEP mid-flight:
+ * the already-completed configs keep their reports and their paper_scenarios
+ * rows, and a relaunch resumes at the first one that has not run yet instead of
+ * spending an hour recomputing an answer already sitting in Telegram.
+ */
+const SKIP_KEYS = new Set(
+  (process.env.SWEEP_SKIP_KEYS ?? "")
+    .split(",")
+    .map((k) => k.trim())
+    .filter((k) => k.length > 0),
+);
+
 interface SweepConfig {
   key: string;
   /** Plain-language statement of what this cell tests, quoted into the report caption. */
@@ -69,12 +83,15 @@ interface SweepConfig {
   /** Payback horizon fed to checkEntryThreshold, in minutes. */
   paybackMinutes: Big;
   /**
-   * Perp leg's own margin leverage. NOTE this does NOT scale position size —
-   * emulation/borrowCost.ts models it purely as `borrowedFraction = 1 - 1/L`
-   * financing cost on the same notional, so raising it strictly ADDS cost
-   * (which is the FM-27 danger it exists to price, not a way to size up).
-   * Sizing up is `positionSizeUsd`, bounded by risk/leverage.ts's
-   * CONCENTRATION_MAX = 0.25 of equity.
+   * Perp leg's own margin leverage. It does NOT scale position size by itself —
+   * emulation/borrowCost.ts models it purely as a `borrowedFraction = 1 - 1/L`
+   * financing cost on whatever notional is requested, so raising it ALONE only
+   * adds cost (the FM-27 danger it exists to price).
+   *
+   * Leverage's real-world benefit shows up only when it is paired with the
+   * larger `positionSizeUsd` that the same capital now affords — see
+   * `leverageRung`, which derives that size via notionalForCapital instead of
+   * letting the two drift apart.
    */
   leverage: Big;
   /** Fixed notional per leg; undefined = adaptivePositionSizing.ts decides. */
@@ -84,15 +101,51 @@ interface SweepConfig {
 }
 
 /**
- * Ordered most-informative-first, because the deadline may cut the tail off:
- * config 1 is the direct test of explanation (b) against run-4's own universe
- * (identical symbols, only the horizon changes — so any difference isolates
- * the horizon), and config 2 the direct test of (a) (identical horizon to
- * run-4, only the universe tightens).
+ * run-4's own settings, reused verbatim by every config that is not
+ * deliberately varying them — that is what makes each config a controlled A/B
+ * against a result we already have on the table, rather than a fresh run with
+ * nothing to compare to.
  */
 const RUN4_PERP_FLOOR = new Big("10000000");
 const RUN4_SPOT_FLOOR = new Big("2000000");
 const RUN4_HORIZON = new Big(3 * 24 * 60); // 9 settlements
+
+/**
+ * The owner's 80/20 split on a $1000 deposit — the capital budget every rung of
+ * the leverage ladder below holds CONSTANT so that leverage is the only thing
+ * varying. Without pinning capital, a leverage comparison silently compares two
+ * different position sizes and tells you nothing about leverage itself.
+ */
+const OWNER_WORKING_CAPITAL = new Big("800");
+
+/**
+ * One rung of the leverage ladder. `notionalForCapital` is imported from
+ * strategy/capitalAllocation.ts rather than re-derived here so the sweep and
+ * the allocation model can never disagree about what a capital budget buys.
+ *
+ * `concentrationHeadroom` lifts the single-coin cap just above the notional
+ * this rung actually requests — the cap must not be the thing that vetoes the
+ * rung under test, or the experiment measures the cap instead of the leverage.
+ */
+function leverageRung(leverage: string, concentrationCap: string): SweepConfig {
+  const L = new Big(leverage);
+  const notional = notionalForCapital(OWNER_WORKING_CAPITAL, L);
+  const borrowedPct = new Big(1).minus(new Big(1).div(L)).times(100);
+  return {
+    key: `lev-${leverage}-capital-800`,
+    hypothesis:
+      `ЛЕСТНИЦА ПЛЕЧА, ступень ${leverage}x. Капитал зафиксирован на $800 (раскладка 80/20), ` +
+      `плечо меняется — и именно поэтому оборот другой: $${notional.toFixed(0)} вместо $400 при плече 1.0. ` +
+      `Занято ${borrowedPct.toFixed(0)}% позиции, значит начисляется стоимость займа. ` +
+      "Вопрос ступени: перевешивает ли рост funding с большего оборота стоимость займа и возросший риск ликвидации?",
+    minPerpTurnover24h: RUN4_PERP_FLOOR,
+    minSpotTurnover24h: RUN4_SPOT_FLOOR,
+    paybackMinutes: RUN4_HORIZON,
+    leverage: L,
+    positionSizeUsd: notional,
+    maxConcentration: new Big(concentrationCap),
+  };
+}
 
 const SWEEP: SweepConfig[] = [
   {
@@ -106,6 +159,11 @@ const SWEEP: SweepConfig[] = [
     positionSizeUsd: new Big("400"),
     maxConcentration: new Big("0.40"),
   },
+  // Leverage ladder, capital pinned at $800. Ordered ascending so that if the
+  // deadline truncates the tail, what survives is still a monotone series.
+  leverageRung("1.5", "0.50"),
+  leverageRung("2", "0.56"),
+  leverageRung("3", "0.62"),
   {
     key: "horizon-1x8h",
     hypothesis:
@@ -311,6 +369,10 @@ async function main(): Promise<void> {
   const skipped: string[] = [];
 
   for (const cfg of SWEEP) {
+    if (SKIP_KEYS.has(cfg.key)) {
+      console.log(`[sweep] skipping ${cfg.key} (SWEEP_SKIP_KEYS)`);
+      continue;
+    }
     if (Date.now() >= deadlineMs) {
       console.log(`[sweep] deadline reached — skipping ${cfg.key}`);
       skipped.push(cfg.key);
