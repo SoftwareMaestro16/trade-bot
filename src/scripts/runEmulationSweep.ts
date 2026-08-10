@@ -271,6 +271,8 @@ export function buildSweepCaption(
     (cfg.maxConcentration
       ? `\nЛимит концентрации: ${cfg.maxConcentration.times(100).toFixed(0)}% (боевой — 25%, ТАБУ п.11)`
       : "") +
+    `\nОдновременных позиций: ${String(cfg.maxConcurrentPositions ?? 1)}` +
+    `\nСкидка на прогноз funding: ${(cfg.fundingRealizationFactor ?? new Big("0.65")).times(100).toFixed(0)}%` +
     `\n\n` +
     `⚠️ Это исследовательский прогон на 5 днях данных, НЕ подтверждение прибыльности. ` +
     `Пороги оборота ослаблены относительно боевых — на таких парах хуже исполнение.\n` +
