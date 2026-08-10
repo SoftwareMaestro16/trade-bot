@@ -204,6 +204,7 @@ export async function pickBestCandidate(
   t: Date,
   availableEquity: Big,
   sizeFraction: Big,
+  excludeSymbols: ReadonlySet<string> = new Set(),
 ): Promise<CandidateEvaluation | undefined> {
   // Evaluated concurrently, not one-symbol-at-a-time: evaluateCandidate is a
   // pure read (no shared mutable state, no cross-symbol ordering dependency —
@@ -218,8 +219,15 @@ export async function pickBestCandidate(
   // only ever use a handful of symbols. Bounded implicitly by the `db` pool's
   // own connection limit (pg.Pool default max=10, storage/db.ts) — excess
   // queries queue on the pool rather than opening unbounded connections.
+  // Filtered BEFORE evaluation, not after: an excluded symbol is one already
+  // held, and evaluating it would spend ~5 DB queries only to discard the
+  // result — at ~300 symbols per tick that is the dominant cost in this loop.
+  // Excluding held symbols also keeps two slots from landing in the same coin,
+  // which is not diversification but one double-sized position in disguise,
+  // and would slip past checkConcentration (it sees each leg separately).
+  const candidateSymbols = resolved.symbols.filter((sym) => !excludeSymbols.has(sym));
   const evaluations = await Promise.all(
-    resolved.symbols.map((symbol) => evaluateCandidate(db, resolved, symbol, t, availableEquity, sizeFraction)),
+    candidateSymbols.map((symbol) => evaluateCandidate(db, resolved, symbol, t, availableEquity, sizeFraction)),
   );
   const passing: CandidateEvaluation[] = evaluations.filter((e): e is CandidateEvaluation => e !== undefined);
   if (passing.length === 0) return undefined;

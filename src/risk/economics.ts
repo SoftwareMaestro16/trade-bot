@@ -8,6 +8,33 @@ const PREMIUM_DRIVEN_THRESHOLD_R8H = new Big("0.0005"); // +0.05%/8h, RISK-REGIS
 // truth instead of hand-duplicating this literal.
 export const ENTRY_FLOOR_R8H = new Big("0.0002"); // 0.020%/8h — never 0.010%, PARAMS-CONSERVATIVE.md §5
 const ENTRY_GROSS_MULTIPLIER = new Big("2.0"); // K, RR-24/FM-01
+
+/**
+ * Fraction of a PREDICTED funding rate that has historically actually settled.
+ *
+ * Bybit quotes a predicted rate for the next settlement, and entries are
+ * decided on it — but it is a forecast that keeps moving until settlement, and
+ * it moves down. Measured 2026-08-11 over this project's own collected
+ * predicted/settled pairs (join on symbol + funding_timestamp_ms, both
+ * normalized to r8h):
+ *
+ *   predicted 0.02-0.05%/8h  n=121  ->  84.3% realized
+ *   predicted 0.05-0.15%/8h  n=103  ->  75.3% realized
+ *   predicted above 0.15%/8h n=11   ->  65.3% realized
+ *
+ * The shortfall WIDENS as the predicted rate rises — i.e. it is worst exactly
+ * in the range an entry decision cares about — so this takes the worst
+ * measured bucket rather than a blended average. Erring low only ever makes
+ * the gate stricter (less credited income for identical cost), which is the
+ * safe direction for a number this thinly calibrated: 11 observations in that
+ * top bucket is not a distribution, and this should be recomputed once Фаза 1
+ * has weeks rather than days of settled history behind it.
+ *
+ * A factor of 1.0 (what this code effectively assumed before) is not a neutral
+ * choice — it is the assertion that predictions are unbiased, which the data
+ * above contradicts in every bucket.
+ */
+export const DEFAULT_FUNDING_REALIZATION_FACTOR = new Big("0.65");
 const DEFAULT_BLACKOUT_SECONDS = 60; // RISK-REGISTER.md FM-40
 // PARAMS-CONSERVATIVE.md §6: real VIP0 per-leg rates are ~0.055-0.10%
 // (spot maker=taker 0.10%, perp taker ~0.055%, round-trip 0.31%/4 legs); even
@@ -43,6 +70,7 @@ export function checkEntryThreshold(
   r8h: Big,
   expectedHoldIntervals: Big,
   totalRoundTripCost: Big,
+  fundingRealizationFactor: Big = DEFAULT_FUNDING_REALIZATION_FACTOR,
 ): VetoResult {
   if (r8h.lt(ENTRY_FLOOR_R8H)) {
     return deny(
@@ -51,7 +79,13 @@ export function checkEntryThreshold(
     );
   }
 
-  const expectedGross = r8h.times(expectedHoldIntervals);
+  // Discounted, because `r8h` here is Bybit's PREDICTED rate for the next
+  // settlement and the rate that actually settles is systematically lower —
+  // see DEFAULT_FUNDING_REALIZATION_FACTOR. The floor check above deliberately
+  // uses the raw rate: that floor is "is this symbol worth holding at all",
+  // a property of the quoted rate, whereas this comparison is an income
+  // FORECAST and must use the income actually expected to arrive.
+  const expectedGross = r8h.times(fundingRealizationFactor).times(expectedHoldIntervals);
   const requiredGross = totalRoundTripCost.times(ENTRY_GROSS_MULTIPLIER);
   if (expectedGross.lt(requiredGross)) {
     return deny(

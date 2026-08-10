@@ -155,11 +155,11 @@ describe("computeTotalRoundTripCost feeding directly into checkEntryThreshold (R
     const r8h = new Big("0.001");
     const expectedHoldIntervals = new Big("13"); // expectedGross = 0.013
 
-    expect(checkEntryThreshold(r8h, expectedHoldIntervals, cheapCost).allowed).toBe(true);
+    expect(checkEntryThreshold(r8h, expectedHoldIntervals, cheapCost, new Big("1")).allowed).toBe(true);
     // required for realisticCost = 2.0 * 0.0049 = 0.0098; 0.013 >= 0.0098 still allows here,
     // so tighten the hold window to actually cross the boundary this raised cost creates.
     const tighterIntervals = new Big("9"); // expectedGross = 0.009 < 0.0098
-    expect(checkEntryThreshold(r8h, tighterIntervals, cheapCost).allowed).toBe(true); // 0.009 >= 2*0.0031=0.0062
-    expect(checkEntryThreshold(r8h, tighterIntervals, realisticCost).allowed).toBe(false); // 0.009 < 0.0098
+    expect(checkEntryThreshold(r8h, tighterIntervals, cheapCost, new Big("1")).allowed).toBe(true); // 0.009 >= 2*0.0031=0.0062
+    expect(checkEntryThreshold(r8h, tighterIntervals, realisticCost, new Big("1")).allowed).toBe(false); // 0.009 < 0.0098
   });
 });

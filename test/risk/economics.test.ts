@@ -44,8 +44,42 @@ describe("checkEntryThreshold", () => {
 
   it("allows exactly at the K=2.0x boundary (expectedGross == requiredGross)", () => {
     // r8h=0.001, intervals=1 -> expectedGross=0.001; cost=0.0005 -> required=0.001. Equal.
-    const result = checkEntryThreshold(new Big("0.001"), new Big("1"), new Big("0.0005"));
+    // Realization factor pinned to 1 so this isolates the K boundary itself; the
+    // production default discounts the rate and is exercised separately below.
+    const result = checkEntryThreshold(new Big("0.001"), new Big("1"), new Big("0.0005"), new Big("1"));
     expect(result.allowed).toBe(true);
+  });
+});
+
+describe("checkEntryThreshold — predicted-vs-settled realization haircut", () => {
+  // Same inputs that sit EXACTLY on the K=2.0 boundary at factor 1.0 above.
+  const r8h = new Big("0.001");
+  const intervals = new Big("1");
+  const cost = new Big("0.0005");
+
+  it("denies at the default factor what an unbiased forecast would have allowed", () => {
+    // 0.001 * 0.65 = 0.00065 expected gross vs 0.001 required -> denied.
+    const result = checkEntryThreshold(r8h, intervals, cost);
+    expect(result).toMatchObject({ allowed: false, code: "EXPECTED_GROSS_TOO_LOW" });
+  });
+
+  it("still allows once the predicted rate is high enough to clear the bar AFTER the haircut", () => {
+    // Needs r8h * 0.65 >= 0.001, i.e. r8h >= ~0.001538.
+    expect(checkEntryThreshold(new Big("0.00154"), intervals, cost).allowed).toBe(true);
+  });
+
+  it("leaves the raw-rate floor check undiscounted — that floor is about the quoted rate, not forecast income", () => {
+    // 0.00019 is under ENTRY_FLOOR_R8H (0.0002) on its own, so the floor fires
+    // regardless of the haircut, and with its own code rather than the gross one.
+    const result = checkEntryThreshold(new Big("0.00019"), new Big("100"), new Big("0.0000001"));
+    expect(result).toMatchObject({ allowed: false, code: "FUNDING_RATE_BELOW_FLOOR" });
+  });
+
+  it("a stricter factor can only ever deny more, never allow more", () => {
+    const generous = checkEntryThreshold(r8h, intervals, cost, new Big("1"));
+    const harsh = checkEntryThreshold(r8h, intervals, cost, new Big("0.5"));
+    expect(generous.allowed).toBe(true);
+    expect(harsh.allowed).toBe(false);
   });
 });
 

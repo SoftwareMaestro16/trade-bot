@@ -1,7 +1,7 @@
 import type Big from "big.js";
 import { checkAccountMMRate, checkConcentration, checkLeverage, CONCENTRATION_MAX } from "./leverage.js";
 import { checkSlippage, checkTurnover, estimateSlippage, MIN_PERP_TURNOVER_24H, MIN_SPOT_TURNOVER_24H } from "./liquidity.js";
-import { checkEntryThreshold, checkFundingBlackout, checkNetFundingRate, isPremiumDriven } from "./economics.js";
+import { checkEntryThreshold, checkFundingBlackout, checkNetFundingRate, isPremiumDriven, DEFAULT_FUNDING_REALIZATION_FACTOR } from "./economics.js";
 import type { VetoResult } from "./types.js";
 import { deny } from "./types.js";
 import type { OrderbookLevel } from "../market-data/types.js";
@@ -33,12 +33,20 @@ export interface RiskThresholds {
    * before anyone argues for changing the production default.
    */
   maxConcentration: Big;
+  /**
+   * Haircut applied to a PREDICTED funding rate before it is credited as
+   * expected income — see economics.ts's DEFAULT_FUNDING_REALIZATION_FACTOR
+   * for the measurement behind the default. Overridable so a sweep can show
+   * what the old implicit 1.0 was costing.
+   */
+  fundingRealizationFactor: Big;
 }
 
 export const DEFAULT_RISK_THRESHOLDS: RiskThresholds = {
   minPerpTurnover24h: MIN_PERP_TURNOVER_24H,
   minSpotTurnover24h: MIN_SPOT_TURNOVER_24H,
   maxConcentration: CONCENTRATION_MAX,
+  fundingRealizationFactor: DEFAULT_FUNDING_REALIZATION_FACTOR,
 };
 
 /**
@@ -117,6 +125,7 @@ export function checkEntry(input: EntryCheckInput, thresholds: RiskThresholds = 
     input.r8h,
     input.expectedHoldIntervals,
     input.totalRoundTripCost,
+    thresholds.fundingRealizationFactor,
   );
   if (!entryThresholdResult.allowed) return entryThresholdResult;
 
@@ -161,5 +170,6 @@ export {
   checkNetFundingRate,
   computeNetFundingRate,
   checkFeeRateSanity,
+  DEFAULT_FUNDING_REALIZATION_FACTOR,
 } from "./economics.js";
 export { checkDrawdown, computeDrawdown } from "./drawdown.js";

@@ -98,6 +98,10 @@ interface SweepConfig {
   positionSizeUsd?: Big;
   /** Single-coin NOTIONAL cap; undefined = risk/leverage.ts's real CONCENTRATION_MAX. */
   maxConcentration?: Big;
+  /** Slots; undefined = 1, i.e. RR-22's production cap. */
+  maxConcurrentPositions?: number;
+  /** Predicted-funding haircut; undefined = economics.ts's measured default. */
+  fundingRealizationFactor?: Big;
 }
 
 /**
@@ -147,7 +151,36 @@ function leverageRung(leverage: string, concentrationCap: string): SweepConfig {
   };
 }
 
+function parallelSlots(slots: number): SweepConfig {
+  return {
+    key: `parallel-${String(slots)}-slots`,
+    hypothesis:
+      `ПАРАЛЛЕЛЬНЫЕ ПОЗИЦИИ, ${String(slots)} слотов. Всё как в базовой конфигурации, но бот может держать ` +
+      `${String(slots)} позиции одновременно вместо одной (RR-22 снят — это фазовый предохранитель, не архитектурный запрет). ` +
+      "Смысл: с одним слотом бот простаивал ~91% времени. Но слоты умножают возможности только если несколько пар " +
+      "проходят вето ОДНОВРЕМЕННО — если в логе счётчик parallel-capacity нулевой, слоты не дадут ничего.",
+    minPerpTurnover24h: RUN4_PERP_FLOOR,
+    minSpotTurnover24h: RUN4_SPOT_FLOOR,
+    paybackMinutes: RUN4_HORIZON,
+    leverage: new Big("1"),
+    maxConcurrentPositions: slots,
+  };
+}
+
 const SWEEP: SweepConfig[] = [
+  {
+    key: "baseline-1slot-haircut",
+    hypothesis:
+      "КОНТРОЛЬ. Настройки run-4 (адаптивный размер, плечо 1, горизонт 9 периодов, 1 слот), но с новой скидкой " +
+      "на прогноз funding (0.65 — измерено: приходит 65-84% от обещанного). Показывает, сколько сделок отсекает " +
+      "одна только эта поправка, и служит опорой для сравнения со всеми конфигурациями ниже.",
+    minPerpTurnover24h: RUN4_PERP_FLOOR,
+    minSpotTurnover24h: RUN4_SPOT_FLOOR,
+    paybackMinutes: RUN4_HORIZON,
+    leverage: new Big("1"),
+  },
+  parallelSlots(3),
+  parallelSlots(5),
   {
     key: "owner-80-20-notional-400",
     hypothesis:
@@ -266,7 +299,9 @@ async function runOne(
       minPerpTurnover24h: cfg.minPerpTurnover24h,
       minSpotTurnover24h: cfg.minSpotTurnover24h,
       ...(cfg.maxConcentration ? { maxConcentration: cfg.maxConcentration } : {}),
+      ...(cfg.fundingRealizationFactor ? { fundingRealizationFactor: cfg.fundingRealizationFactor } : {}),
     },
+    ...(cfg.maxConcurrentPositions ? { maxConcurrentPositions: cfg.maxConcurrentPositions } : {}),
     expectedPaybackMinutes: cfg.paybackMinutes,
     ...(cfg.positionSizeUsd ? { positionSizeUsd: cfg.positionSizeUsd } : {}),
   };

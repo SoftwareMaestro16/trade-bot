@@ -1,4 +1,4 @@
-import type Big from "big.js";
+import Big from "big.js";
 import type { Kysely } from "kysely";
 import type { Database } from "../../storage/schema.js";
 import { computeEquitySnapshot } from "../equityEngine.js";
@@ -38,14 +38,18 @@ async function writeEquitySnapshot(
   db: Kysely<Database>,
   scenarioId: bigint,
   t: Date,
-  pos: OpenPositionState | null,
+  positions: readonly OpenPositionState[],
   cashOutsidePosition: Big,
   peakEquity: Big,
 ): Promise<{ peakEquity: Big; totalEquity: Big }> {
-  let totalEquity: Big;
-  let marginBalance: Big;
+  // Every open position contributes its own mark-to-market equity and its own
+  // spot-leg notional; both sums fold over the list so a one-slot run produces
+  // byte-identical numbers to the pre-parallel single-position code (the empty
+  // list collapses to cashOutsidePosition, exactly as the old `else` branch).
+  let totalEquity = cashOutsidePosition;
+  let spotLegNotionalNow = new Big(0);
 
-  if (pos) {
+  for (const pos of positions) {
     const perpTicker = await latestTickerAtOrBefore(db, pos.symbol, "linear", t);
     const spotTicker = await latestTickerAtOrBefore(db, pos.symbol, "spot", t);
     const perpMarkPrice = perpTicker?.markPrice ?? pos.perpEntryPrice;
@@ -61,14 +65,12 @@ async function writeEquitySnapshot(
       fundingAccrued: pos.fundingAccrued,
       borrowCostAccrued: pos.borrowCostAccrued,
     });
-    totalEquity = cashOutsidePosition.plus(snap.totalEquity);
-    // margin_balance approximation — see module doc comment.
-    const spotLegNotionalNow = pos.spotQty.times(spotMarkPrice);
-    marginBalance = totalEquity.minus(spotLegNotionalNow);
-  } else {
-    totalEquity = cashOutsidePosition;
-    marginBalance = cashOutsidePosition;
+    totalEquity = totalEquity.plus(snap.totalEquity);
+    spotLegNotionalNow = spotLegNotionalNow.plus(pos.spotQty.times(spotMarkPrice));
   }
+
+  // margin_balance approximation — see module doc comment.
+  const marginBalance = totalEquity.minus(spotLegNotionalNow);
 
   const isPeak = totalEquity.gte(peakEquity);
 
@@ -140,6 +142,7 @@ function resolveConfig(config: ScenarioConfig): ResolvedScenarioConfig {
     positionSizeUsd: config.positionSizeUsd,
     riskThresholds: { ...DEFAULT_RISK_THRESHOLDS, ...config.riskThresholds },
     expectedPaybackMinutes: config.expectedPaybackMinutes ?? EXPECTED_PAYBACK_MINUTES,
+    maxConcurrentPositions: config.maxConcurrentPositions ?? 1,
   };
 }
 
@@ -153,7 +156,12 @@ async function executeScenario(
 
   let cashOutsidePosition = config.startingDeposit;
   let peakEquity = config.startingDeposit;
-  let openPosition: OpenPositionState | null = null;
+  // RR-22 caps this at 1 by default (resolveConfig), which is what production
+  // still enforces. Held as a list so a sweep can raise the cap and measure
+  // whether extra slots earn anything — the constraint that made this worth
+  // building is that the strategy sat flat ~91% of the time with one slot,
+  // and slots only help if several symbols clear the veto chain at once.
+  const openPositions: OpenPositionState[] = [];
   let paperState: PaperPositionState = "IDLE";
   let positionsOpened = 0;
   let positionsClosed = 0;
@@ -174,42 +182,75 @@ async function executeScenario(
   const closedTradeHistory: TradeOutcome[] = [];
 
   for (const t of ticks) {
-    if (openPosition) {
-      const outcome = await processOpenPositionTick(db, openPosition, t, resolved);
+    // Iterated back-to-front so a close can splice in place without shifting
+    // an index that has not been visited yet.
+    for (let i = openPositions.length - 1; i >= 0; i--) {
+      const pos = openPositions[i];
+      if (!pos) continue; // satisfies noUncheckedIndexedAccess
+      const outcome = await processOpenPositionTick(db, pos, t, resolved);
       if (outcome.closed) {
         // Net of borrow cost, not raw realizedPnl.ts output — "did this trade
         // net make money" (cashReturned vs. what left the idle-cash pool to
         // open it) is what should drive the next sizing decision, not gross
         // P&L before the drag that leverage scenarios specifically add.
         closedTradeHistory.push({
-          realizedPnl: outcome.cashReturned.minus(openPosition.initialCapital),
+          realizedPnl: outcome.cashReturned.minus(pos.initialCapital),
           equityAtClose: cashOutsidePosition.plus(outcome.cashReturned),
         });
         cashOutsidePosition = cashOutsidePosition.plus(outcome.cashReturned);
         paperState = transition(paperState, outcome.forced ? "RISK_FORCE_CLOSE" : "STRATEGY_EXIT_APPROVED");
         paperState = transition(paperState, "BOTH_LEGS_CLOSED");
         paperState = transition(paperState, "JOURNALED");
-        openPosition = null;
+        openPositions.splice(i, 1);
         positionsClosed++;
       }
     }
 
-    // RR-22: only ever evaluated while flat. Also gated on !drawdownHalted —
-    // PARAMS-CONSERVATIVE.md §9: a drawdown breach means "стоп до ручного
-    // рестарта", not "close this one position and keep trading."
-    if (!openPosition && !drawdownHalted && cashOutsidePosition.gt(0)) {
+    // Gated on !drawdownHalted — PARAMS-CONSERVATIVE.md §9: a drawdown breach
+    // means "стоп до ручного рестарта", not "close positions and keep trading."
+    //
+    // Loops so several slots can be filled on the SAME tick: with one slot the
+    // loop body runs at most once and this is exactly the old behaviour. Each
+    // pass re-evaluates against the shrinking cash pool, so slot N is sized
+    // against what slot N-1 actually left behind rather than against the
+    // pre-entry balance — otherwise filling k slots would commit k times the
+    // capital the sizing rule authorised once.
+    //
+    // Already-held symbols are excluded rather than deduplicated afterward:
+    // two positions in the same coin is not diversification, it is one
+    // double-sized position wearing a disguise, and it would slip past
+    // checkConcentration (which sees each leg separately).
+    while (
+      openPositions.length < resolved.maxConcurrentPositions &&
+      !drawdownHalted &&
+      cashOutsidePosition.gt(0)
+    ) {
       const sizeFraction = computeNextPositionSizeFraction(closedTradeHistory);
-      const winner = await pickBestCandidate(db, resolved, t, cashOutsidePosition, sizeFraction);
-      if (winner) {
-        paperState = transition(paperState, "INTENT_RECORDED");
-        openPosition = await openNewPosition(db, scenarioId, resolved, t, winner);
-        paperState = transition(paperState, "BOTH_LEGS_OPENED");
-        cashOutsidePosition = cashOutsidePosition.minus(openPosition.initialCapital);
-        positionsOpened++;
-      }
+      const heldSymbols = new Set(openPositions.map((p) => p.symbol));
+      const winner = await pickBestCandidate(db, resolved, t, cashOutsidePosition, sizeFraction, heldSymbols);
+      if (!winner) break;
+
+      // Affordability guard. With equity-fraction sizing each successive slot
+      // is naturally smaller (it is a fraction of the SHRINKING cash pool), so
+      // this never binds. With a FIXED positionSizeUsd it binds immediately:
+      // every slot would demand the same capital regardless of what is left,
+      // and slot 2 of a $400-notional config on a $1000 deposit would overdraw
+      // the account into negative cash — which then silently poisons every
+      // downstream percentage, since equity is the denominator everywhere.
+      const projectedCapital = winner.spotQty
+        .times(winner.spotPrice)
+        .plus(winner.perpQty.times(winner.perpMarkPrice).div(resolved.leverage));
+      if (projectedCapital.gt(cashOutsidePosition)) break;
+
+      paperState = transition(paperState, "INTENT_RECORDED");
+      const opened = await openNewPosition(db, scenarioId, resolved, t, winner);
+      paperState = transition(paperState, "BOTH_LEGS_OPENED");
+      cashOutsidePosition = cashOutsidePosition.minus(opened.initialCapital);
+      openPositions.push(opened);
+      positionsOpened++;
     }
 
-    const snapshot = await writeEquitySnapshot(db, scenarioId, t, openPosition, cashOutsidePosition, peakEquity);
+    const snapshot = await writeEquitySnapshot(db, scenarioId, t, openPositions, cashOutsidePosition, peakEquity);
     peakEquity = snapshot.peakEquity;
 
     // RR-40/41/42, PARAMS-CONSERVATIVE.md §8/§9: checked every tick, not just
@@ -219,10 +260,15 @@ async function executeScenario(
     const drawdownResult = checkDrawdown(snapshot.totalEquity, peakEquity);
     if (!drawdownHalted && !drawdownResult.allowed) {
       drawdownHalted = true;
-      if (openPosition) {
+      // Every slot, not just one: §9's "стоп" is an account-level stop, and
+      // leaving sibling positions open after a drawdown breach would keep
+      // exactly the exposure the rule exists to remove.
+      while (openPositions.length > 0) {
+        const pos = openPositions.pop();
+        if (!pos) break; // satisfies noUncheckedIndexedAccess
         const cashReturned = await forceClosePosition(
           db,
-          openPosition,
+          pos,
           t,
           "DRAWDOWN_EXCEEDED",
           `${drawdownResult.reason} Force-closed and halting new entries for the rest of this scenario ` +
@@ -230,44 +276,46 @@ async function executeScenario(
           resolved,
         );
         closedTradeHistory.push({
-          realizedPnl: cashReturned.minus(openPosition.initialCapital),
+          realizedPnl: cashReturned.minus(pos.initialCapital),
           equityAtClose: cashOutsidePosition.plus(cashReturned),
         });
         cashOutsidePosition = cashOutsidePosition.plus(cashReturned);
         paperState = transition(paperState, "RISK_FORCE_CLOSE");
         paperState = transition(paperState, "BOTH_LEGS_CLOSED");
         paperState = transition(paperState, "JOURNALED");
-        openPosition = null;
         positionsClosed++;
       }
     }
   }
 
   // Never leave a position open at the end of the range.
-  if (openPosition) {
+  if (openPositions.length > 0) {
     const lastT = ticks[ticks.length - 1];
     if (lastT) {
-      const cashReturned = await forceClosePosition(
-        db,
-        openPosition,
-        lastT,
-        "SCENARIO_END",
-        "Scenario date range ended with the position still open — force-closed at the last tick so no paper " +
-          "position outlives its own run (never a strategy or risk decision).",
-        resolved,
-      );
-      closedTradeHistory.push({
-        realizedPnl: cashReturned.minus(openPosition.initialCapital),
-        equityAtClose: cashOutsidePosition.plus(cashReturned),
-      });
-      cashOutsidePosition = cashOutsidePosition.plus(cashReturned);
-      paperState = transition(paperState, "STRATEGY_EXIT_APPROVED");
-      paperState = transition(paperState, "BOTH_LEGS_CLOSED");
-      paperState = transition(paperState, "JOURNALED");
-      openPosition = null;
-      positionsClosed++;
+      while (openPositions.length > 0) {
+        const pos = openPositions.pop();
+        if (!pos) break; // satisfies noUncheckedIndexedAccess
+        const cashReturned = await forceClosePosition(
+          db,
+          pos,
+          lastT,
+          "SCENARIO_END",
+          "Scenario date range ended with the position still open — force-closed at the last tick so no paper " +
+            "position outlives its own run (never a strategy or risk decision).",
+          resolved,
+        );
+        closedTradeHistory.push({
+          realizedPnl: cashReturned.minus(pos.initialCapital),
+          equityAtClose: cashOutsidePosition.plus(cashReturned),
+        });
+        cashOutsidePosition = cashOutsidePosition.plus(cashReturned);
+        paperState = transition(paperState, "STRATEGY_EXIT_APPROVED");
+        paperState = transition(paperState, "BOTH_LEGS_CLOSED");
+        paperState = transition(paperState, "JOURNALED");
+        positionsClosed++;
+      }
 
-      await writeEquitySnapshot(db, scenarioId, lastT, null, cashOutsidePosition, peakEquity);
+      await writeEquitySnapshot(db, scenarioId, lastT, [], cashOutsidePosition, peakEquity);
     }
   }
 

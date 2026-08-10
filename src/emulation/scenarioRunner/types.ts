@@ -75,6 +75,18 @@ export interface ScenarioConfig {
    * exit behaviour actually supports.
    */
   expectedPaybackMinutes?: Big;
+  /**
+   * How many positions may be open at once. Defaults to 1 — RR-22 (SRS.md
+   * §2.3) caps live trading there until Фаза 4 closes, and OPEN-QUESTIONS.md
+   * records 3 as the eventual assumption, so this is a phase gate rather than
+   * an architectural limit.
+   *
+   * Raising it is what tests whether extra slots earn anything: the strategy
+   * sat flat ~91% of the observed window with one slot, but N slots only help
+   * if N symbols clear the whole veto chain SIMULTANEOUSLY — which is exactly
+   * what candidateSelection.ts's parallel-capacity log line measures.
+   */
+  maxConcurrentPositions?: number;
 }
 
 export interface ScenarioRunResult {
@@ -100,6 +112,7 @@ export interface ResolvedScenarioConfig {
   positionSizeUsd: Big | undefined;
   riskThresholds: RiskThresholds;
   expectedPaybackMinutes: Big;
+  maxConcurrentPositions: number;
 }
 
 export interface TickerSnapshot {
