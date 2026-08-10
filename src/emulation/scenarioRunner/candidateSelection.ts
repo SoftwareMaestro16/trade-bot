@@ -224,6 +224,19 @@ export async function pickBestCandidate(
   const passing: CandidateEvaluation[] = evaluations.filter((e): e is CandidateEvaluation => e !== undefined);
   if (passing.length === 0) return undefined;
 
+  // RR-22 caps live trading at ONE open position until Phase 4 closes, so only
+  // `ranked[0]` is ever acted on below and the rest of `passing` is discarded
+  // silently. That discard hides the one number needed to judge whether lifting
+  // the cap would earn anything: how many symbols clear the FULL veto chain at
+  // the same instant. Four parallel slots multiply nothing if this is almost
+  // always 1. Logged rather than returned because raising the cap is a separate
+  // decision from measuring its ceiling — this line changes no behaviour.
+  if (passing.length > 1) {
+    console.debug(
+      `[scenarioRunner] parallel-capacity at=${t.toISOString()} passing=${String(passing.length)} symbols=${passing.map((c) => c.symbol).join(",")}`,
+    );
+  }
+
   const ranked = rankCandidates(
     passing.map((c) => ({ symbol: c.symbol, yield: computeCandidateYield(c.r8h, c.legNotional, availableEquity) })),
   );
