@@ -11,8 +11,9 @@ import { getTickTimestamps, latestTickerAtOrBefore } from "./dbReaders.js";
 import { pickBestCandidate } from "./candidateSelection.js";
 import { openNewPosition, closePosition } from "./positionLifecycle.js";
 import { processOpenPositionTick } from "./tickProcessing.js";
-import { HOURLY_BORROW_RATE_FALLBACK, SPOT_TAKER_FEE_RATE_FALLBACK, PERP_TAKER_FEE_RATE_FALLBACK } from "./types.js";
+import { HOURLY_BORROW_RATE_FALLBACK, SPOT_TAKER_FEE_RATE_FALLBACK, PERP_TAKER_FEE_RATE_FALLBACK, EXPECTED_PAYBACK_MINUTES } from "./types.js";
 import type { ScenarioConfig, ScenarioRunResult, ResolvedScenarioConfig, OpenPositionState } from "./types.js";
+import { DEFAULT_RISK_THRESHOLDS } from "../../risk/index.js";
 
 /**
  * scenarioRunner split (mechanical refactor): the orchestrator — equity
@@ -137,6 +138,8 @@ function resolveConfig(config: ScenarioConfig): ResolvedScenarioConfig {
     spotTakerFeeRate: config.spotTakerFeeRate ?? SPOT_TAKER_FEE_RATE_FALLBACK,
     perpTakerFeeRate: config.perpTakerFeeRate ?? PERP_TAKER_FEE_RATE_FALLBACK,
     positionSizeUsd: config.positionSizeUsd,
+    riskThresholds: { ...DEFAULT_RISK_THRESHOLDS, ...config.riskThresholds },
+    expectedPaybackMinutes: config.expectedPaybackMinutes ?? EXPECTED_PAYBACK_MINUTES,
   };
 }
 

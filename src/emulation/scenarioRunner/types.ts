@@ -1,5 +1,6 @@
 import Big from "big.js";
 import type { DeltaNeutralLiquidationInput, MarginTier } from "../liquidation.js";
+import type { RiskThresholds } from "../../risk/index.js";
 
 /**
  * scenarioRunner split (mechanical refactor): constants, public types, and
@@ -51,6 +52,29 @@ export interface ScenarioConfig {
   perpTakerFeeRate?: Big;
   /** Fixed target notional per leg, overriding the equity-fraction default — see module doc comment's "Position sizing". */
   positionSizeUsd?: Big;
+  /**
+   * Overrides risk/index.ts's DEFAULT_RISK_THRESHOLDS (PARAMS-CONSERVATIVE.md's
+   * real production floors) for this scenario only — production code paths
+   * never set this, it exists for one-off pipeline smoke-test runs (see
+   * scripts/runEmulationScenario.ts's SMOKE_TEST_RELAXED_THRESHOLDS). Partial:
+   * unset fields keep the real default.
+   */
+  riskThresholds?: Partial<RiskThresholds>;
+  /**
+   * Overrides EXPECTED_PAYBACK_MINUTES (PARAMS-CONSERVATIVE.md §5's 3-day
+   * payback window) in checkEntryThreshold's expected-income arithmetic.
+   *
+   * Exists because run-4 (2026-08-10) exposed a concrete mismatch, not as a
+   * tuning knob: the entry gate credits a candidate with `r8h * 9` of funding
+   * income (9 = 3 days / 8h), but all 7 of that run's positions exited after
+   * 0.07-3.98h, i.e. 0-1 settlements — the gate was validating an assumption
+   * reality violated by ~an order of magnitude, so every entry cleared "income
+   * >= 2x round-trip cost" on income it never had a chance to collect. Lowering
+   * this makes the entry bar STRICTER (less credited income for the same cost),
+   * never looser. Sweeping it is how we find what hold horizon the observed
+   * exit behaviour actually supports.
+   */
+  expectedPaybackMinutes?: Big;
 }
 
 export interface ScenarioRunResult {
@@ -74,6 +98,8 @@ export interface ResolvedScenarioConfig {
   spotTakerFeeRate: Big;
   perpTakerFeeRate: Big;
   positionSizeUsd: Big | undefined;
+  riskThresholds: RiskThresholds;
+  expectedPaybackMinutes: Big;
 }
 
 export interface TickerSnapshot {

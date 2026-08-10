@@ -39,6 +39,28 @@ const LEVERAGE = new Big("1"); // 1.0 = fully self-funded, no borrowing (PARAMS-
 const STARTING_DEPOSIT_USD = new Big("1000");
 const REPORTS_DIR = path.resolve(process.cwd(), "reports");
 
+/**
+ * One-off pipeline smoke test, 2026-08-10: the real PARAMS-CONSERVATIVE.md §4
+ * turnover floors ($100M perp / $20M spot) intersected with real economics
+ * (funding-rate premium ≥0.05%/8h) turned out empty across every emulation run
+ * so far — not a bug, verified against live mainnet data (see
+ * scripts/runEmulationScenario.ts's own doc comment above: the funding/economics
+ * thresholds are untouched and real, some symbols DO clear them organically,
+ * e.g. GRVTUSDT ~0.2%/8h — but every symbol clearing the funding bar during
+ * this observed window had turnover well under $30M, and every symbol clearing
+ * turnover had funding near-flat). Flipping this on relaxes ONLY the turnover
+ * floor (risk/index.ts's RiskThresholds — the economics checks are NOT
+ * touched) so at least a few real symbols can clear the whole veto chain and
+ * exercise position-open/close/report/Telegram end-to-end. This is a pipeline
+ * mechanics check, not a profitability read — buildLowCoverageCaveat-style
+ * loud labeling below makes sure a run like this is never mistaken for one.
+ * PARAMS-CONSERVATIVE.md's real production floors are untouched by this flag:
+ * it only ever affects this ad-hoc script's own ScenarioConfig.
+ */
+const SMOKE_TEST_RELAXED_THRESHOLDS = true;
+const SMOKE_TEST_MIN_PERP_TURNOVER_24H = new Big("10000000"); // $10M, vs $100M real floor
+const SMOKE_TEST_MIN_SPOT_TURNOVER_24H = new Big("2000000"); // $2M, vs $20M real floor
+
 // Below this many hours of observed data, the run is statistically close to
 // meaningless (well under even one funding interval's worth of settlements
 // for most symbols) — printed as a loud caveat, never silently omitted.
@@ -154,13 +176,29 @@ async function main(): Promise<void> {
   }
 
   const config: ScenarioConfig = {
-    name: SCENARIO_NAME,
+    name: SMOKE_TEST_RELAXED_THRESHOLDS ? `${SCENARIO_NAME}-relaxed-smoketest` : SCENARIO_NAME,
     leverage: LEVERAGE,
     startingDeposit: STARTING_DEPOSIT_USD,
     symbols,
     startAt,
     endAt,
+    ...(SMOKE_TEST_RELAXED_THRESHOLDS
+      ? {
+          riskThresholds: {
+            minPerpTurnover24h: SMOKE_TEST_MIN_PERP_TURNOVER_24H,
+            minSpotTurnover24h: SMOKE_TEST_MIN_SPOT_TURNOVER_24H,
+          },
+        }
+      : {}),
   };
+  if (SMOKE_TEST_RELAXED_THRESHOLDS) {
+    console.log(
+      `[run-emulation] *** RELAXED-THRESHOLDS SMOKE TEST *** — turnover floors lowered to ` +
+        `$${SMOKE_TEST_MIN_PERP_TURNOVER_24H.toString()} perp / $${SMOKE_TEST_MIN_SPOT_TURNOVER_24H.toString()} spot ` +
+        `(real floors: $100M / $20M). Funding-rate economics thresholds are UNCHANGED. ` +
+        "This run checks pipeline mechanics, not profitability — do not read these numbers as a strategy signal.",
+    );
+  }
 
   console.log("[run-emulation] running scenario...");
   const result = await runScenario(db, config);

@@ -3,8 +3,11 @@ import { allow, deny } from "./types.js";
 import type { VetoResult } from "./types.js";
 import type { OrderbookLevel } from "../market-data/types.js";
 
-const MIN_PERP_TURNOVER_24H = new Big("100000000"); // PARAMS-CONSERVATIVE.md §4
-const MIN_SPOT_TURNOVER_24H = new Big("20000000");
+// Exported so callers needing a non-default floor (e.g. emulation/'s smoke-test
+// threshold override, see risk/index.ts's RiskThresholds) start from the same
+// source of truth instead of hand-duplicating these literals.
+export const MIN_PERP_TURNOVER_24H = new Big("100000000"); // PARAMS-CONSERVATIVE.md §4
+export const MIN_SPOT_TURNOVER_24H = new Big("20000000");
 const MAX_SLIPPAGE_BP = new Big("0.0005"); // PARAMS-CONSERVATIVE.md §6, 0.05% per leg
 
 /**
@@ -14,17 +17,22 @@ const MAX_SLIPPAGE_BP = new Big("0.0005"); // PARAMS-CONSERVATIVE.md §6, 0.05% 
  * so screening on perp turnover alone (a common mistake) would systematically
  * admit symbols that cannot actually be exited cheaply.
  */
-export function checkTurnover(perpTurnover24h: Big, spotTurnover24h: Big): VetoResult {
-  if (perpTurnover24h.lt(MIN_PERP_TURNOVER_24H)) {
+export function checkTurnover(
+  perpTurnover24h: Big,
+  spotTurnover24h: Big,
+  minPerpTurnover24h: Big = MIN_PERP_TURNOVER_24H,
+  minSpotTurnover24h: Big = MIN_SPOT_TURNOVER_24H,
+): VetoResult {
+  if (perpTurnover24h.lt(minPerpTurnover24h)) {
     return deny(
       "PERP_TURNOVER_TOO_LOW",
-      `Perp 24h turnover ${perpTurnover24h.toString()} is below the ${MIN_PERP_TURNOVER_24H.toString()} USDT floor (PARAMS-CONSERVATIVE.md §4).`,
+      `Perp 24h turnover ${perpTurnover24h.toString()} is below the ${minPerpTurnover24h.toString()} USDT floor (PARAMS-CONSERVATIVE.md §4).`,
     );
   }
-  if (spotTurnover24h.lt(MIN_SPOT_TURNOVER_24H)) {
+  if (spotTurnover24h.lt(minSpotTurnover24h)) {
     return deny(
       "SPOT_TURNOVER_TOO_LOW",
-      `Spot 24h turnover ${spotTurnover24h.toString()} is below the ${MIN_SPOT_TURNOVER_24H.toString()} USDT floor (PARAMS-CONSERVATIVE.md §4).`,
+      `Spot 24h turnover ${spotTurnover24h.toString()} is below the ${minSpotTurnover24h.toString()} USDT floor (PARAMS-CONSERVATIVE.md §4).`,
     );
   }
   return allow();

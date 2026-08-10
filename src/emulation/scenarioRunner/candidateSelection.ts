@@ -2,7 +2,7 @@ import type Big from "big.js";
 import type { Kysely } from "kysely";
 import type { Database } from "../../storage/schema.js";
 import { checkEntry } from "../../risk/index.js";
-import { estimateSlippage } from "../../risk/liquidity.js";
+import { estimateSlippage, checkTurnover } from "../../risk/liquidity.js";
 import { computeTotalRoundTripCost } from "../../risk/totalRoundTripCost.js";
 import { rankCandidates, computeCandidateYield } from "../../strategy/rankCandidates.js";
 import { sizePosition } from "../../strategy/sizing.js";
@@ -11,7 +11,7 @@ import { latestLongShortRatioAtOrBefore } from "../../market-data/collectLongSho
 import { computeBorrowCost8h } from "../borrowCost.js";
 import { computeMaintenanceMargin, lookupMarginTier } from "../liquidation.js";
 import { latestPredictedFundingAtOrBefore, latestTickerAtOrBefore, orderbookSideAtOrBefore, latestOpenInterestAtOrBefore } from "./dbReaders.js";
-import { DEFAULT_PERP_QTY_STEP, EXPECTED_PAYBACK_MINUTES } from "./types.js";
+import { DEFAULT_PERP_QTY_STEP } from "./types.js";
 import type { ResolvedScenarioConfig, CandidateEvaluation } from "./types.js";
 
 /**
@@ -41,6 +41,29 @@ async function evaluateCandidate(
   const perpTicker = await latestTickerAtOrBefore(db, symbol, "linear", t);
   const spotTicker = await latestTickerAtOrBefore(db, symbol, "spot", t);
   if (!perpTicker || perpTicker.markPrice === null || !spotTicker) return undefined;
+
+  // Hoisted copy of the FIRST veto checkEntry would apply below (its zone check
+  // is a compile-time `false` here, so turnover is effectively first). Purely a
+  // cost optimization, semantically a no-op: identical inputs, identical veto,
+  // and because nothing between here and checkEntry can produce a DIFFERENT
+  // veto that should have won, hoisting cannot reorder which reason is
+  // reported. Worth it because the two orderbookSideAtOrBefore calls below are
+  // the most expensive queries in this function and the overwhelming majority
+  // of (symbol, tick) pairs die right here — measured 2026-08-10: ~79k turnover
+  // vetoes in the first 50 minutes of a sweep, each of which had already paid
+  // for both orderbook reads it never used.
+  const earlyTurnover = checkTurnover(
+    perpTicker.turnover24h,
+    spotTicker.turnover24h,
+    resolved.riskThresholds.minPerpTurnover24h,
+    resolved.riskThresholds.minSpotTurnover24h,
+  );
+  if (!earlyTurnover.allowed) {
+    console.debug(
+      `[scenarioRunner] entry vetoed symbol=${symbol} at=${t.toISOString()} code=${earlyTurnover.code} reason=${earlyTurnover.reason}`,
+    );
+    return undefined;
+  }
 
   const perpMarkPrice = perpTicker.markPrice;
   const spotPrice = spotTicker.lastPrice;
@@ -104,7 +127,10 @@ async function evaluateCandidate(
   // of intervalMinutes — verified against PARAMS-CONSERVATIVE.md §5's own
   // worked example (the 4h-symbol raw threshold is exactly half the 8h-symbol
   // raw threshold, i.e. identical once normalized to r8h).
-  const expectedHoldIntervals = EXPECTED_PAYBACK_MINUTES.div(REFERENCE_INTERVAL_MINUTES);
+  // Sourced from the resolved config (defaulting to EXPECTED_PAYBACK_MINUTES)
+  // rather than the module constant directly — see ScenarioConfig's
+  // expectedPaybackMinutes doc comment for why this became a sweepable input.
+  const expectedHoldIntervals = resolved.expectedPaybackMinutes.div(REFERENCE_INTERVAL_MINUTES);
 
   const projectedShortNotional = sized.perpQty.times(perpMarkPrice);
   const projectedSpotLegNotional = sized.spotQty.times(spotPrice);
@@ -131,7 +157,7 @@ async function evaluateCandidate(
     nowMs: t.getTime(),
     nextFundingTimeMs: predicted.nextFundingTimeMs,
     isInnovationOrAdventureZone: false,
-  });
+  }, resolved.riskThresholds);
 
   if (!veto.allowed) {
     console.debug(

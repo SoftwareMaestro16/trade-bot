@@ -4,7 +4,14 @@ import type { VetoResult } from "./types.js";
 
 const LEVERAGE_MAX = new Big("1.5");
 const ACCOUNT_MMR_MAX = new Big("0.30");
-const CONCENTRATION_MAX = new Big("0.25");
+/**
+ * PARAMS-CONSERVATIVE.md §11 / ТАБУ п.11. Exported so callers that legitimately
+ * need to reason about (or, in emulation only, override) the cap start from the
+ * single source of truth instead of re-typing the literal — see
+ * strategy/capitalAllocation.ts's describeAllocationConflicts, which converts a
+ * capital budget into the notional this cap actually governs.
+ */
+export const CONCENTRATION_MAX = new Big("0.25");
 
 /**
  * RR-20 (SRS.md) / DECISIONS.md ADR-006 п.4: Bybit does not define "effective
@@ -85,7 +92,11 @@ export function checkAccountMMRate(projectedAccountMMRate: Big): VetoResult {
  * checkEntry's fixed check order — where checkLeverage runs first and would
  * already have thrown — does not protect every caller.
  */
-export function checkConcentration(spotLegNotional: Big, totalEquity: Big): VetoResult {
+export function checkConcentration(
+  spotLegNotional: Big,
+  totalEquity: Big,
+  concentrationMax: Big = CONCENTRATION_MAX,
+): VetoResult {
   if (totalEquity.lte(0)) {
     throw new RangeError(`totalEquity must be positive, got ${totalEquity.toString()}`);
   }
@@ -97,15 +108,15 @@ export function checkConcentration(spotLegNotional: Big, totalEquity: Big): Veto
   if (spotLegNotional.lt(0)) {
     return deny(
       "CONCENTRATION_NOTIONAL_IMPLAUSIBLE",
-      `spotLegNotional ${spotLegNotional.toString()} is negative — not a legitimate spot leg notional, failing closed instead of passing the one-sided ${CONCENTRATION_MAX.toString()} cap check (RR-21).`,
+      `spotLegNotional ${spotLegNotional.toString()} is negative — not a legitimate spot leg notional, failing closed instead of passing the one-sided ${concentrationMax.toString()} cap check (RR-21).`,
     );
   }
 
   const concentration = spotLegNotional.div(totalEquity);
-  if (concentration.gt(CONCENTRATION_MAX)) {
+  if (concentration.gt(concentrationMax)) {
     return deny(
       "CONCENTRATION_EXCEEDED",
-      `Position concentration ${concentration.toString()} exceeds the ${CONCENTRATION_MAX.toString()} single-coin cap (PARAMS-CONSERVATIVE.md §11).`,
+      `Position concentration ${concentration.toString()} exceeds the ${concentrationMax.toString()} single-coin cap (PARAMS-CONSERVATIVE.md §11).`,
     );
   }
   return allow();

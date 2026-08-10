@@ -1,10 +1,45 @@
 import type Big from "big.js";
-import { checkAccountMMRate, checkConcentration, checkLeverage } from "./leverage.js";
-import { checkSlippage, checkTurnover, estimateSlippage } from "./liquidity.js";
+import { checkAccountMMRate, checkConcentration, checkLeverage, CONCENTRATION_MAX } from "./leverage.js";
+import { checkSlippage, checkTurnover, estimateSlippage, MIN_PERP_TURNOVER_24H, MIN_SPOT_TURNOVER_24H } from "./liquidity.js";
 import { checkEntryThreshold, checkFundingBlackout, checkNetFundingRate, isPremiumDriven } from "./economics.js";
 import type { VetoResult } from "./types.js";
 import { deny } from "./types.js";
 import type { OrderbookLevel } from "../market-data/types.js";
+
+/**
+ * The narrow set of PARAMS-CONSERVATIVE.md limits an EMULATION may override to
+ * measure what a different setting would have done. Production callers pass
+ * nothing and get DEFAULT_RISK_THRESHOLDS, i.e. the real documented limits.
+ *
+ * Deliberately kept small. checkEntry's other checks (funding-rate economics,
+ * slippage, effective leverage, account MMR) have no override: real market data
+ * has shown symbols organically clearing those bars, so there is no measurement
+ * question to answer by loosening them. Each field here earned its place by a
+ * concrete "we cannot answer this without measuring it" question — do not add
+ * more without the same justification. This is a measurement hatch, not a
+ * general "loosen risk/" config surface, and nothing here changes what the live
+ * bot enforces.
+ */
+export interface RiskThresholds {
+  minPerpTurnover24h: Big;
+  minSpotTurnover24h: Big;
+  /**
+   * PARAMS-CONSERVATIVE.md §11 / ТАБУ п.11's single-coin cap, on NOTIONAL (not
+   * on committed capital — a delta-neutral position commits
+   * `notional * (1 + 1/leverage)`, so a "how much of the deposit is working"
+   * target converts to roughly HALF that in notional at leverage 1.0; see
+   * strategy/capitalAllocation.ts). Overridable for the same reason the
+   * turnover floors are: so an emulation can MEASURE what a looser cap does
+   * before anyone argues for changing the production default.
+   */
+  maxConcentration: Big;
+}
+
+export const DEFAULT_RISK_THRESHOLDS: RiskThresholds = {
+  minPerpTurnover24h: MIN_PERP_TURNOVER_24H,
+  minSpotTurnover24h: MIN_SPOT_TURNOVER_24H,
+  maxConcentration: CONCENTRATION_MAX,
+};
 
 /**
  * ARCHITECTURE.md §2: "strategy/ говорит 'хочу открыть позицию', risk/ имеет
@@ -53,7 +88,7 @@ export interface EntryCheckInput {
  * does not re-test each check's internal boundary math — that would duplicate
  * risk/leverage.test.ts etc. rather than testing anything new.
  */
-export function checkEntry(input: EntryCheckInput): VetoResult {
+export function checkEntry(input: EntryCheckInput, thresholds: RiskThresholds = DEFAULT_RISK_THRESHOLDS): VetoResult {
   // PARAMS-CONSERVATIVE.md §4: zone exclusion is a flat veto, checked first —
   // cheapest possible check, and everything downstream is moot if it fails.
   if (input.isInnovationOrAdventureZone) {
@@ -63,7 +98,12 @@ export function checkEntry(input: EntryCheckInput): VetoResult {
     );
   }
 
-  const turnoverResult = checkTurnover(input.perpTurnover24h, input.spotTurnover24h);
+  const turnoverResult = checkTurnover(
+    input.perpTurnover24h,
+    input.spotTurnover24h,
+    thresholds.minPerpTurnover24h,
+    thresholds.minSpotTurnover24h,
+  );
   if (!turnoverResult.allowed) return turnoverResult;
 
   if (!isPremiumDriven(input.premiumIndexR8h)) {
@@ -97,7 +137,11 @@ export function checkEntry(input: EntryCheckInput): VetoResult {
   const leverageResult = checkLeverage(input.projectedShortNotional, input.totalEquity);
   if (!leverageResult.allowed) return leverageResult;
 
-  const concentrationResult = checkConcentration(input.projectedSpotLegNotional, input.totalEquity);
+  const concentrationResult = checkConcentration(
+    input.projectedSpotLegNotional,
+    input.totalEquity,
+    thresholds.maxConcentration,
+  );
   if (!concentrationResult.allowed) return concentrationResult;
 
   const mmrResult = checkAccountMMRate(input.projectedAccountMMRate);
@@ -107,7 +151,7 @@ export function checkEntry(input: EntryCheckInput): VetoResult {
 }
 
 export type { VetoResult } from "./types.js";
-export { checkLeverage, checkAccountMMRate, checkConcentration } from "./leverage.js";
+export { checkLeverage, checkAccountMMRate, checkConcentration, CONCENTRATION_MAX } from "./leverage.js";
 export { checkTurnover, checkSlippage, estimateSlippage } from "./liquidity.js";
 export type { SlippageEstimate } from "./liquidity.js";
 export {
