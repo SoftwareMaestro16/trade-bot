@@ -22,6 +22,9 @@ import { gatherMarketStats } from "./analysis/marketStats.js";
 import { assessMarket } from "./analysis/marketAssessment.js";
 import { evaluateScan } from "./analysis/scanAlert.js";
 import type { ScanState } from "./analysis/scanAlert.js";
+import { buildFallbackClient, buildToolset } from "./analysis/llm/index.js";
+import type { Toolset } from "./analysis/llm/index.js";
+import { fetchRecentAnnouncements, formatAnnouncementsContext } from "./market-data/announcements.js";
 import { scheduleRepeating, type ScheduledTask } from "./scheduleRepeating.js";
 import { createDb } from "./storage/db.js";
 
@@ -271,16 +274,45 @@ async function main(): Promise<void> {
     // в памяти: рестарт перевзводит (при живом шансе алертнёт один раз), это
     // приемлемо — коллектор перезапускается редко. Оценка — те же
     // детерминированные assessMarket/vetos, что и кнопка «📈 Рынок».
+    // LLM для ОБЪЯСНЕНИЯ алерта (не для решения): когда сканер решил, что
+    // появился шанс, к детерминированным цифрам добавляется человеческое
+    // резюме. Решение об алерте (evaluateScan) остаётся полностью
+    // детерминированным. Строится только при наличии ключа; иначе алерт —
+    // просто цифры.
+    const scanToolset: Toolset | null = env.LLM_API_KEY
+      ? buildToolset(
+          buildFallbackClient({
+            apiKey: env.LLM_API_KEY,
+            ...(env.LLM_MODEL ? { primaryModel: env.LLM_MODEL } : {}),
+            onFallback: (i, e) => logger.warn({ failedIndex: i, err: e.message }, "market-scan LLM: fallback"),
+          }),
+        )
+      : null;
+
     let previousScanState: ScanState | null = null;
     tasks.push(
       scheduleRepeating(
         "market-scan",
         async () => {
-          const assessment = assessMarket(await gatherMarketStats(db));
+          const stats = await gatherMarketStats(db);
+          const assessment = assessMarket(stats);
           const decision = evaluateScan(assessment, previousScanState);
           previousScanState = decision.newState;
           if (decision.alert && decision.message !== null) {
-            await enqueueNotification(db, decision.message);
+            // Детерминированные цифры (decision.message) — всегда. LLM-пояснение
+            // сверху, если модель ответила: reason'ы почему это шанс, простыми
+            // словами. Сбой LLM (narrative=null) молча пропускается — алерт всё
+            // равно уходит с цифрами. Анонсы Bybit — контекст (скоро делистят X).
+            let message = decision.message;
+            if (scanToolset) {
+              const annCtx = formatAnnouncementsContext(await fetchRecentAnnouncements());
+              const r = await scanToolset.marketAssessment.run({
+                stats,
+                ...(annCtx.length > 0 ? { extraContext: annCtx } : {}),
+              });
+              if (r.narrative !== null) message = `${message}\n\n🧠 ${r.narrative}`;
+            }
+            await enqueueNotification(db, message);
             await deliverPending(db, telegramConfig);
             logger.info(
               { task: "market-scan", score: assessment.suitabilityScore, opportunities: assessment.opportunities.length },
