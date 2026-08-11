@@ -102,6 +102,8 @@ interface SweepConfig {
   maxConcurrentPositions?: number;
   /** Predicted-funding haircut; undefined = economics.ts's measured default. */
   fundingRealizationFactor?: Big;
+  /** Basis-stability requirement in sigmas; undefined = basisStability.ts's default. */
+  minSigmasToStop?: Big;
 }
 
 /**
@@ -168,6 +170,41 @@ function parallelSlots(slots: number): SweepConfig {
 }
 
 const SWEEP: SweepConfig[] = [
+  {
+    key: "basis-filter-OFF",
+    hypothesis:
+      "КОНТРОЛЬ A/B. Фильтр волатильности базиса отключён (0 сигм), всё остальное — настройки baseline. " +
+      "Должен воспроизвести прежний результат: 8 сделок, -$4.41. Если воспроизвёл — значит новый фильтр " +
+      "ничего постороннего не сломал, и разница со следующей конфигурацией целиком его заслуга.",
+    minPerpTurnover24h: RUN4_PERP_FLOOR,
+    minSpotTurnover24h: RUN4_SPOT_FLOOR,
+    paybackMinutes: RUN4_HORIZON,
+    leverage: new Big("1"),
+    minSigmasToStop: new Big("0"),
+  },
+  {
+    key: "basis-filter-ON-3sigma",
+    hypothesis:
+      "ФИЛЬТР ВОЛАТИЛЬНОСТИ БАЗИСА, 3 сигмы. Единственное отличие от предыдущей конфигурации. " +
+      "Не входим, если аварийный порог 0.5% ближе трёх стандартных отклонений базиса — то есть если " +
+      "обычное колебание способно выбить позицию до первой выплаты funding. Ожидание: отсекает все " +
+      "8 сделок (ZBT/GRVT/CAP имеют 1.9-2.5 сигмы), убыток становится нулевым.",
+    minPerpTurnover24h: RUN4_PERP_FLOOR,
+    minSpotTurnover24h: RUN4_SPOT_FLOOR,
+    paybackMinutes: RUN4_HORIZON,
+    leverage: new Big("1"),
+  },
+  {
+    key: "basis-filter-ON-2sigma",
+    hypothesis:
+      "Тот же фильтр, но мягче — 2 сигмы. Покажет форму зависимости: какие сделки выживают при более " +
+      "слабом требовании и лучше ли итог, чем при полном отказе от торговли.",
+    minPerpTurnover24h: RUN4_PERP_FLOOR,
+    minSpotTurnover24h: RUN4_SPOT_FLOOR,
+    paybackMinutes: RUN4_HORIZON,
+    leverage: new Big("1"),
+    minSigmasToStop: new Big("2"),
+  },
   {
     key: "baseline-1slot-haircut",
     hypothesis:
@@ -302,6 +339,7 @@ async function runOne(
       minSpotTurnover24h: cfg.minSpotTurnover24h,
       ...(cfg.maxConcentration ? { maxConcentration: cfg.maxConcentration } : {}),
       ...(cfg.fundingRealizationFactor ? { fundingRealizationFactor: cfg.fundingRealizationFactor } : {}),
+      ...(cfg.minSigmasToStop ? { minSigmasToStop: cfg.minSigmasToStop } : {}),
     },
     ...(cfg.maxConcurrentPositions ? { maxConcurrentPositions: cfg.maxConcurrentPositions } : {}),
     expectedPaybackMinutes: cfg.paybackMinutes,
