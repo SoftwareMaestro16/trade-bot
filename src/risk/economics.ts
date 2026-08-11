@@ -2,7 +2,11 @@ import Big from "big.js";
 import { allow, deny } from "./types.js";
 import type { VetoResult } from "./types.js";
 
-const PREMIUM_DRIVEN_THRESHOLD_R8H = new Big("0.0005"); // +0.05%/8h, RISK-REGISTER.md FM-01
+// +0.05%/8h, RISK-REGISTER.md FM-01. Exported so read-only consumers (the
+// market-suitability assessment behind the Telegram "Рынок" button and the
+// periodic scanner) classify a symbol against the SAME bar the veto enforces,
+// rather than hardcoding a second copy that could drift from it.
+export const PREMIUM_DRIVEN_THRESHOLD_R8H = new Big("0.0005");
 // Exported so non-live-trading consumers (offline report/label generation,
 // e.g. predictive/episodeExtraction.ts) can import the single source of
 // truth instead of hand-duplicating this literal.
