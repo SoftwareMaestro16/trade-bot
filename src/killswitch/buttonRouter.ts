@@ -70,11 +70,14 @@ const LLM_KEYBOARD: InlineKeyboardMarkup = {
   ],
 };
 
-const STATUS_KEYBOARD: InlineKeyboardMarkup = {
-  inlineKeyboard: [
-    [{ text: "🔄 Обновить", callbackData: "status" }],
-    [{ text: "⬅️ Меню", callbackData: "menu" }],
-  ],
+/**
+ * Кнопка под rich-отчётами Статуса/Помощи: их нельзя редактировать на месте
+ * (нет editRichMessage), поэтому они приходят новым сообщением, а убрать их
+ * владелец может этой кнопкой. Экспортирована — listener вешает её на
+ * sendStatusReport/sendHelp.
+ */
+export const DELETE_KEYBOARD: InlineKeyboardMarkup = {
+  inlineKeyboard: [[{ text: "🗑 Удалить", callbackData: "delete" }]],
 };
 
 /** Пока грузятся асинхронные данные — только выход в меню. */
@@ -113,10 +116,8 @@ export interface ButtonRouterDeps extends CommandRouterDeps {
   editMenuMessage: (messageId: number, text: string, keyboard: InlineKeyboardMarkup, parseMode?: "Markdown" | "HTML") => Promise<void>;
   /** MUST be called exactly once per callback_query — see notify/telegram.ts's answerCallbackQuery doc comment. */
   answerCallback: (callbackQueryId: string, toastText?: string) => Promise<void>;
-  /** Статус Фазы 1 в HTML для показа в меню на месте. Никогда не бросает. */
-  renderStatus: () => Promise<string>;
-  /** Список команд в HTML. Никогда не бросает. */
-  renderHelp: () => Promise<string>;
+  /** Удаляет сообщение (кнопка «🗑 Удалить» под rich-отчётами). Никогда не бросает. */
+  deleteMessage: (messageId: number) => Promise<void>;
   /** Собирает и форматирует оценку рынка (без LLM). Никогда не бросает — на сбое отдаёт текст ошибки. */
   renderMarket: () => Promise<string>;
   /** То же + резюме LLM. При отсутствии/сбое LLM отдаёт оценку без резюме. */
@@ -160,13 +161,16 @@ export async function routeCallbackQuery(
 ): Promise<void> {
   switch (data) {
     case "status":
+    case "help":
+      // Rich-таблицу нельзя редактировать на месте — шлём новым сообщением
+      // (с кнопкой «🗑 Удалить», её вешает listener в sendStatusReport/sendHelp).
+      routeAuthorizedCommand(data, [], chatId, deps);
       void deps.answerCallback(callbackQueryId);
-      await showAsync(deps, messageId, "⏳ Собираю статус…", deps.renderStatus, STATUS_KEYBOARD, "HTML");
       return;
 
-    case "help":
-      void deps.answerCallback(callbackQueryId);
-      await showAsync(deps, messageId, "⏳ …", deps.renderHelp, BACK_ONLY_KEYBOARD, "HTML");
+    case "delete":
+      void deps.deleteMessage(messageId);
+      void deps.answerCallback(callbackQueryId, "Удалено");
       return;
 
     case "menu":

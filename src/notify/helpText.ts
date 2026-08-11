@@ -29,25 +29,3 @@ export function formatHelpTable(docs: readonly CommandDoc[]): string {
   // markdown paragraph into a space) — heading and table are separate blocks.
   return ["# ℹ️ Команды", rows.join("\n")].join("\n\n");
 }
-
-function escapeHtml(text: string): string {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-/**
- * HTML-версия помощи для editMessageText (parseMode "HTML") — в отличие от
- * formatHelpTable, которая рендерит rich-таблицу через sendRichMessage
- * отдельным сообщением. Нужна для показа помощи ВНУТРИ меню на месте (кнопка
- * ❓ Помощь редактирует то же сообщение, а не шлёт новое). Таблиц у
- * editMessageText нет, поэтому список — командой в <code>, описанием обычным
- * текстом.
- */
-export function formatHelpText(docs: readonly CommandDoc[]): string {
-  const lines = ["<b>ℹ️ Команды</b>", ""];
-  for (const doc of docs) {
-    lines.push(`<code>${escapeHtml(doc.usage)}</code>`);
-    lines.push(escapeHtml(doc.description));
-    lines.push("");
-  }
-  return lines.join("\n").trimEnd();
-}

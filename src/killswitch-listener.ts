@@ -12,16 +12,16 @@ import type { HaltStateDatabase } from "./killswitch/haltStatePersistence.js";
 import { isAuthorizedChat, manageAuthorizedUserCommand } from "./killswitch/authorizedUsers.js";
 import { COMMAND_DOCS, routeAuthorizedCommand } from "./killswitch/commandRouter.js";
 import type { CommandRouterDeps } from "./killswitch/commandRouter.js";
-import { MENU_KEYBOARD, MENU_TEXT, routeCallbackQuery } from "./killswitch/buttonRouter.js";
+import { MENU_KEYBOARD, MENU_TEXT, DELETE_KEYBOARD, routeCallbackQuery } from "./killswitch/buttonRouter.js";
 import type { ButtonRouterDeps } from "./killswitch/buttonRouter.js";
 import { logger as rootLogger } from "./logger.js";
-import { answerCallbackQuery, editMessageText, sendAlert, sendRichMessage } from "./notify/telegram.js";
+import { answerCallbackQuery, editMessageText, sendAlert, sendRichMessage, deleteMessage } from "./notify/telegram.js";
 import type { InlineKeyboardMarkup, TelegramConfig } from "./notify/telegram.js";
 import { deliverPending, enqueueNotification } from "./notify/notificationQueue.js";
 import { startCommandPolling } from "./notify/telegramPolling.js";
 import type { TelegramPollingHandle } from "./notify/telegramPolling.js";
-import { computeStatusReport, formatStatusReportTable, formatStatusReport } from "./notify/statusReport.js";
-import { formatHelpTable, formatHelpText } from "./notify/helpText.js";
+import { computeStatusReport, formatStatusReportTable } from "./notify/statusReport.js";
+import { formatHelpTable } from "./notify/helpText.js";
 import { scheduleRepeating } from "./scheduleRepeating.js";
 import type { ScheduledTask } from "./scheduleRepeating.js";
 import type { Database } from "./storage/schema.js";
@@ -240,7 +240,7 @@ async function main(): Promise<void> {
     if (!telegramConfig) return;
     try {
       const report = await computeStatusReport(statusDb, state);
-      await sendRichMessage(telegramConfig, formatStatusReportTable(report));
+      await sendRichMessage(telegramConfig, formatStatusReportTable(report), { replyMarkup: DELETE_KEYBOARD });
     } catch (e) {
       logger.error({ err: e }, "failed to build/send /status reply");
     }
@@ -256,7 +256,7 @@ async function main(): Promise<void> {
   async function sendHelp(): Promise<void> {
     if (!telegramConfig) return;
     try {
-      await sendRichMessage(telegramConfig, formatHelpTable(COMMAND_DOCS));
+      await sendRichMessage(telegramConfig, formatHelpTable(COMMAND_DOCS), { replyMarkup: DELETE_KEYBOARD });
     } catch (e) {
       logger.error({ err: e }, "failed to build/send /help reply");
     }
@@ -412,14 +412,14 @@ async function main(): Promise<void> {
     return formatHealthReport(await checkLlmHealth(llmHealthTargets));
   }
 
-  // Статус/Помощь в HTML для показа В МЕНЮ на месте (editMessage), в отличие от
-  // sendStatusReport/sendHelp, которые шлют rich-таблицу отдельным сообщением
-  // на типизированные /status, /help.
-  async function renderStatus(): Promise<string> {
-    return formatStatusReport(await computeStatusReport(statusDb, state));
-  }
-  function renderHelp(): Promise<string> {
-    return Promise.resolve(formatHelpText(COMMAND_DOCS));
+  /** Кнопка «🗑 Удалить» под rich-отчётами. Никогда не бросает: неудача удаления не должна ронять диспетчер. */
+  async function deleteMenuMessage(messageId: number): Promise<void> {
+    if (!telegramConfig) return;
+    try {
+      await deleteMessage(telegramConfig, messageId);
+    } catch (e) {
+      logger.error({ err: e }, "failed to delete message");
+    }
   }
 
   // RR-33 (extended): only a chat_id that's either the root admin or already
@@ -448,8 +448,7 @@ async function main(): Promise<void> {
     ...commandRouterDeps,
     editMenuMessage,
     answerCallback,
-    renderStatus,
-    renderHelp,
+    deleteMessage: deleteMenuMessage,
     renderMarket,
     renderMarketLlm,
     checkLlm,

@@ -19,8 +19,7 @@ type MockedDeps = ButtonRouterDeps & {
   manageAuthorizedUser: ReturnType<typeof vi.fn>;
   editMenuMessage: ReturnType<typeof vi.fn>;
   answerCallback: ReturnType<typeof vi.fn>;
-  renderStatus: ReturnType<typeof vi.fn>;
-  renderHelp: ReturnType<typeof vi.fn>;
+  deleteMessage: ReturnType<typeof vi.fn>;
   renderMarket: ReturnType<typeof vi.fn>;
   renderMarketLlm: ReturnType<typeof vi.fn>;
   checkLlm: ReturnType<typeof vi.fn>;
@@ -42,8 +41,7 @@ function makeDeps(overrides?: Partial<ButtonRouterDeps>): MockedDeps {
     logger: makeLogger(),
     editMenuMessage: vi.fn().mockResolvedValue(undefined),
     answerCallback: vi.fn().mockResolvedValue(undefined),
-    renderStatus: vi.fn().mockResolvedValue("СТАТУС-HTML"),
-    renderHelp: vi.fn().mockResolvedValue("ПОМОЩЬ-HTML"),
+    deleteMessage: vi.fn().mockResolvedValue(undefined),
     renderMarket: vi.fn().mockResolvedValue("РЫНОК-ТЕКСТ"),
     renderMarketLlm: vi.fn().mockResolvedValue("РЫНОК+LLM"),
     checkLlm: vi.fn().mockResolvedValue("LLM-ЗДОРОВЬЕ"),
@@ -89,25 +87,26 @@ describe("routeCallbackQuery — kill switch (без изменений пове
     vi.restoreAllMocks();
   });
 
-  it("'status': показывает renderStatus в меню (editMessage, HTML), не шлёт новое сообщение", async () => {
+  it("'status': шлёт rich-отчёт новым сообщением (делегирует sendStatusReport), не редактирует меню", () => {
     const deps = makeDeps();
-    await routeCallbackQuery("status", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
-    expect(deps.sendStatusReport).not.toHaveBeenCalled(); // больше НЕ новое сообщение
-    expect(deps.renderStatus).toHaveBeenCalledTimes(1);
-    const calls = deps.editMenuMessage.mock.calls as [number, string, unknown, string | undefined][];
-    expect(calls[calls.length - 1]![1]).toBe("СТАТУС-HTML");
-    expect(calls[calls.length - 1]![3]).toBe("HTML"); // parseMode
+    void routeCallbackQuery("status", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
+    expect(deps.sendStatusReport).toHaveBeenCalledTimes(1); // rich-таблица новым сообщением
+    expect(deps.editMenuMessage).not.toHaveBeenCalled();
     expect(deps.answerCallback).toHaveBeenCalledWith(CALLBACK_ID);
   });
 
-  it("'help': показывает renderHelp в меню (editMessage, HTML)", async () => {
+  it("'help': шлёт rich-список новым сообщением (делегирует sendHelp)", () => {
     const deps = makeDeps();
-    await routeCallbackQuery("help", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
-    expect(deps.sendHelp).not.toHaveBeenCalled();
-    expect(deps.renderHelp).toHaveBeenCalledTimes(1);
-    const calls = deps.editMenuMessage.mock.calls as [number, string, unknown, string | undefined][];
-    expect(calls[calls.length - 1]![1]).toBe("ПОМОЩЬ-HTML");
-    expect(calls[calls.length - 1]![3]).toBe("HTML");
+    void routeCallbackQuery("help", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
+    expect(deps.sendHelp).toHaveBeenCalledTimes(1);
+    expect(deps.editMenuMessage).not.toHaveBeenCalled();
+  });
+
+  it("'delete': удаляет сообщение с кнопкой и отвечает тостом", () => {
+    const deps = makeDeps();
+    void routeCallbackQuery("delete", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
+    expect(deps.deleteMessage).toHaveBeenCalledWith(MESSAGE_ID);
+    expect(deps.answerCallback).toHaveBeenCalledWith(CALLBACK_ID, "Удалено");
   });
 
   it("'resume': снимает halt через applyAndPersist и правит на подтверждение с тостом", () => {

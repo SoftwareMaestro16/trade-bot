@@ -225,15 +225,41 @@ export async function sendAlert(config: TelegramConfig, text: string, options?: 
  * pipe tables out of it server-side. `text` here is that markdown string,
  * not the already-rendered table — this function does not reformat it.
  */
-export async function sendRichMessage(config: TelegramConfig, markdown: string): Promise<void> {
-  const payload = {
+export async function sendRichMessage(
+  config: TelegramConfig,
+  markdown: string,
+  options?: { replyMarkup?: InlineKeyboardMarkup },
+): Promise<void> {
+  const payload: {
+    chat_id: string;
+    rich_message: { markdown: string };
+    reply_markup?: ReturnType<typeof toWireKeyboard>;
+  } = {
     chat_id: config.allowedChatId,
     rich_message: { markdown },
   };
+  if (options?.replyMarkup) {
+    payload.reply_markup = toWireKeyboard(options.replyMarkup);
+  }
   await postToTelegram(
     `https://api.telegram.org/bot${config.botToken}/sendRichMessage`,
     payload,
     "sendRichMessage",
+    config.requestTimeoutMs,
+  );
+}
+
+/**
+ * Удаляет сообщение бота (Bot API deleteMessage). Нужно для кнопки «🗑 Удалить»
+ * под rich-отчётами Статуса/Помощи: их нельзя редактировать на месте (нет
+ * editRichMessage), поэтому они шлются новым сообщением, а убрать их владелец
+ * может этой кнопкой. Целится в config.allowedChatId, как и всё исходящее.
+ */
+export async function deleteMessage(config: TelegramConfig, messageId: number): Promise<void> {
+  await postToTelegram(
+    `https://api.telegram.org/bot${config.botToken}/deleteMessage`,
+    { chat_id: config.allowedChatId, message_id: messageId },
+    "deleteMessage",
     config.requestTimeoutMs,
   );
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatHelpTable, formatHelpText } from "../../src/notify/helpText.js";
+import { formatHelpTable } from "../../src/notify/helpText.js";
 import { COMMAND_DOCS } from "../../src/killswitch/commandRouter.js";
 import type { CommandDoc } from "../../src/killswitch/commandRouter.js";
 
@@ -43,16 +43,3 @@ describe("formatHelpTable", () => {
   });
 });
 
-describe("formatHelpText — HTML для editMessage", () => {
-  it("оборачивает команду в <code> и экранирует html-спецсимволы", () => {
-    const docs: CommandDoc[] = [{ usage: "/add <chat_id>", description: "a & b < c" }];
-    const out = formatHelpText(docs);
-    expect(out).toContain("<code>/add &lt;chat_id&gt;</code>");
-    expect(out).toContain("a &amp; b &lt; c");
-    expect(out).toContain("<b>ℹ️ Команды</b>");
-  });
-
-  it("рендерит все реальные команды без исключений", () => {
-    expect(formatHelpText(COMMAND_DOCS).length).toBeGreaterThan(0);
-  });
-});
