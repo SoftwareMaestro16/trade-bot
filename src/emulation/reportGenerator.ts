@@ -1,3 +1,4 @@
+import Big from "big.js";
 import type { Kysely } from "kysely";
 import type { Database } from "../storage/schema.js";
 import { fetchClosedTrades, fetchEquitySnapshots, fetchScenarioActivity, fetchScenarios } from "./reportGenerator/dataAccess.js";
@@ -7,12 +8,31 @@ import type {
   EquitySnapshotPoint,
   GenerateReportsResult,
   ScenarioActivity,
+  ScenarioAggregate,
   ScenarioRow,
   ScenarioSummary,
 } from "./reportGenerator/shared.js";
 
 export { csvEscapeField } from "./reportGenerator/csv.js";
-export type { GenerateReportsResult } from "./reportGenerator/shared.js";
+export type { GenerateReportsResult, ScenarioAggregate } from "./reportGenerator/shared.js";
+
+/** Числовой агрегат сценария из его закрытых сделок — суммы компонентов P&L + счётчики. */
+function computeScenarioAggregate(summary: ScenarioSummary): ScenarioAggregate {
+  const t = summary.trades;
+  const sum = (pick: (r: (typeof t)[number]) => Big): Big => t.reduce((acc, r) => acc.plus(pick(r)), new Big(0));
+  return {
+    scenarioId: summary.scenario.id,
+    scenarioName: summary.scenario.name,
+    tradeCount: t.length,
+    winCount: t.filter((r) => r.result === "win").length,
+    fundingUsd: sum((r) => r.fundingUsd),
+    basisPnlUsd: sum((r) => r.basisPnlUsd),
+    feesUsd: sum((r) => r.feesUsd),
+    slippageUsd: sum((r) => r.slippageUsd),
+    borrowCostUsd: sum((r) => r.borrowCostUsd),
+    netPnlUsd: sum((r) => r.netPnlUsd),
+  };
+}
 
 /**
  * Backlog (Фаза 2 эмуляция): turns the rows one or more `scenarioRunner.ts`
@@ -154,5 +174,6 @@ export async function generateReports(
     summaryMarkdown: buildSummaryMarkdown(runId, summaries),
     tradesCsv: buildTradesCsv(summaries),
     equityCurveCsv: buildEquityCurveCsv(equityInputs),
+    aggregates: summaries.map(computeScenarioAggregate),
   };
 }

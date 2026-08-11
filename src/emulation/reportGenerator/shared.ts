@@ -10,10 +10,31 @@ import Big from "big.js";
 // Public types
 // ---------------------------------------------------------------------------
 
+/**
+ * Числовой агрегат по одному сценарию — суммы компонентов P&L и счётчики.
+ * Отдаётся наружу, чтобы вызывающий (scripts/runEmulationScenario.ts) мог
+ * скормить их LLM-инструменту разбора отчёта и собрать детерминированную
+ * подпись, не парся markdown обратно. Издержки со знаком <=0, как в trades.
+ */
+export interface ScenarioAggregate {
+  scenarioId: bigint;
+  scenarioName: string;
+  tradeCount: number;
+  winCount: number;
+  fundingUsd: Big;
+  basisPnlUsd: Big;
+  feesUsd: Big;
+  slippageUsd: Big;
+  borrowCostUsd: Big;
+  netPnlUsd: Big;
+}
+
 export interface GenerateReportsResult {
   summaryMarkdown: string;
   tradesCsv: string;
   equityCurveCsv: string;
+  /** По одному на сценарий, в том же порядке, что и переданные scenarioIds. */
+  aggregates: ScenarioAggregate[];
 }
 
 // ---------------------------------------------------------------------------

@@ -7,7 +7,10 @@ import { generateReports } from "../emulation/reportGenerator.js";
 import { runScenario } from "../emulation/scenarioRunner.js";
 import type { ScenarioConfig } from "../emulation/scenarioRunner.js";
 import { createDb } from "../storage/db.js";
-import { sendDocument } from "../notify/telegram.js";
+import { sendDocument, truncateCaption } from "../notify/telegram.js";
+import { buildFallbackClient, buildToolset } from "../analysis/llm/index.js";
+import { resolveReportCaption, buildCombinedReport } from "../emulation/reportDelivery.js";
+import type { TradeReportInput } from "../analysis/llm/tools/tradeReportTool.js";
 
 /**
  * One-off, manually-run driver — NOT part of collector.ts's regular schedule.
@@ -212,36 +215,44 @@ async function main(): Promise<void> {
   const runId = `${SCENARIO_NAME}-${String(result.scenarioId)}`;
   const reports = await generateReports(db, runId, [result.scenarioId]);
 
+  // Один файл вместо трёх (владелец): summary + trades + equity склеены в
+  // paper_report_<runId>.md (CSV — секциями внутри). Пишем на диск и шлём его же.
+  const combined = buildCombinedReport(runId, reports);
   await mkdir(REPORTS_DIR, { recursive: true });
-  const summaryPath = path.join(REPORTS_DIR, `paper_summary_${runId}.md`);
-  const tradesPath = path.join(REPORTS_DIR, `paper_trades_${runId}.csv`);
-  const equityPath = path.join(REPORTS_DIR, `paper_equity_curve_${runId}.csv`);
-  await writeFile(summaryPath, reports.summaryMarkdown, "utf8");
-  await writeFile(tradesPath, reports.tradesCsv, "utf8");
-  await writeFile(equityPath, reports.equityCurveCsv, "utf8");
-  console.log(`[run-emulation] wrote:\n  ${summaryPath}\n  ${tradesPath}\n  ${equityPath}`);
+  const combinedPath = path.join(REPORTS_DIR, combined.filename);
+  await writeFile(combinedPath, combined.content, "utf8");
+  console.log(`[run-emulation] wrote: ${combinedPath}`);
+
+  // Подпись LLM-first (владелец): сначала резюме от LLM-инструмента разбора
+  // отчёта; если LLM недоступен/сбоил — детерминированная подпись из тех же
+  // чисел. reports.aggregates[0] всегда есть — один сценарий даёт один агрегат.
+  const agg = reports.aggregates[0];
+  const toolset =
+    env.LLM_API_KEY && agg
+      ? buildToolset(buildFallbackClient({ apiKey: env.LLM_API_KEY, ...(env.LLM_MODEL ? { primaryModel: env.LLM_MODEL } : {}) }))
+      : null;
 
   // Optional — same "only wired up if both vars are set" gate collector.ts's
-  // own digest/heartbeat use (config/env.ts leaves both TELEGRAM_* fields
-  // optional). Owner's ask (2026-08-09): the bot itself should hand over the
-  // trade-level detail (which pair, why it opened/closed, what's left of the
-  // deposit), not just a terminal log line only visible to whoever is
-  // watching this script run.
-  if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID) {
-    const caption = buildTelegramCaption(
+  // own digest/heartbeat use. Owner's ask: the bot itself hands over the
+  // trade-level detail, not just a terminal log line.
+  if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && agg) {
+    const reportInput: TradeReportInput = {
       runId,
-      STARTING_DEPOSIT_USD,
-      result.finalEquity,
-      result.positionsOpened,
-      result.positionsClosed,
-      coverageHours,
-      lowCoverageCaveat,
-    );
+      startingDeposit: STARTING_DEPOSIT_USD,
+      endingEquity: result.finalEquity,
+      tradeCount: agg.tradeCount,
+      winCount: agg.winCount,
+      fundingIncome: agg.fundingUsd,
+      basisPnl: agg.basisPnlUsd,
+      fees: agg.feesUsd,
+      slippage: agg.slippageUsd,
+      borrowCost: agg.borrowCostUsd,
+    };
+    const { caption, source } = await resolveReportCaption(reportInput, toolset);
+    const fullCaption = lowCoverageCaveat !== null ? `${caption}\n\n⚠️ ${lowCoverageCaveat}` : caption;
     const telegramConfig = { botToken: env.TELEGRAM_BOT_TOKEN, allowedChatId: env.TELEGRAM_CHAT_ID };
-    await sendDocument(telegramConfig, `paper_summary_${runId}.md`, reports.summaryMarkdown, { caption });
-    await sendDocument(telegramConfig, `paper_trades_${runId}.csv`, reports.tradesCsv);
-    await sendDocument(telegramConfig, `paper_equity_curve_${runId}.csv`, reports.equityCurveCsv);
-    console.log("[run-emulation] sent report files to Telegram");
+    await sendDocument(telegramConfig, combined.filename, combined.content, { caption: truncateCaption(fullCaption) });
+    console.log(`[run-emulation] sent single report file to Telegram (caption source: ${source})`);
   } else {
     console.log("[run-emulation] TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set — skipping Telegram delivery");
   }

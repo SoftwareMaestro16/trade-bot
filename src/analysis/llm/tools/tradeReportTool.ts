@@ -59,28 +59,7 @@ export class TradeReportTool extends NarratingTool<TradeReportInput, TradeReport
   }
 
   protected computeData(input: TradeReportInput): TradeReportFacts {
-    const netPnl = input.endingEquity.minus(input.startingDeposit);
-    const returnPct = input.startingDeposit.gt(0)
-      ? netPnl.div(input.startingDeposit).times(100)
-      : new Big(0);
-    const winRatePct =
-      input.tradeCount > 0 ? new Big(input.winCount).div(input.tradeCount).times(100) : new Big(0);
-
-    // Самый отрицательный вклад среди компонентов. basisPnl двузнаковый —
-    // учитывается только когда он в минусе.
-    const components: { key: string; value: Big }[] = [
-      { key: "fees", value: input.fees },
-      { key: "slippage", value: input.slippage },
-      { key: "borrowCost", value: input.borrowCost },
-      { key: "basisPnl", value: input.basisPnl },
-    ];
-    const worst = components.reduce((a, b) => (b.value.lt(a.value) ? b : a));
-    const dominantLossDriver = worst.value.lt(0) ? (COST_LABELS[worst.key] ?? worst.key) : "нет убыточного компонента";
-
-    const totalCosts = input.fees.plus(input.slippage).plus(input.borrowCost).abs();
-    const costShareOfPnlPct = netPnl.eq(0) ? null : totalCosts.div(netPnl.abs()).times(100);
-
-    return { netPnl, returnPct, winRatePct, dominantLossDriver, costShareOfPnlPct };
+    return computeTradeReportFacts(input);
   }
 
   protected buildPrompt(data: TradeReportFacts, input: TradeReportInput): LlmPrompt {
@@ -92,6 +71,32 @@ export class TradeReportTool extends NarratingTool<TradeReportInput, TradeReport
         formatReportFacts(data, input),
     };
   }
+}
+
+/**
+ * Чистый детерминированный расчёт фактов отчёта. Вынесен из computeData, чтобы
+ * его могла переиспользовать детерминированная подпись-фолбэк (emulation/
+ * reportDelivery.ts), когда LLM недоступен — тогда числа считаются один раз и
+ * в одном месте, а не дублируются.
+ */
+export function computeTradeReportFacts(input: TradeReportInput): TradeReportFacts {
+  const netPnl = input.endingEquity.minus(input.startingDeposit);
+  const returnPct = input.startingDeposit.gt(0) ? netPnl.div(input.startingDeposit).times(100) : new Big(0);
+  const winRatePct = input.tradeCount > 0 ? new Big(input.winCount).div(input.tradeCount).times(100) : new Big(0);
+
+  const components: { key: string; value: Big }[] = [
+    { key: "fees", value: input.fees },
+    { key: "slippage", value: input.slippage },
+    { key: "borrowCost", value: input.borrowCost },
+    { key: "basisPnl", value: input.basisPnl },
+  ];
+  const worst = components.reduce((a, b) => (b.value.lt(a.value) ? b : a));
+  const dominantLossDriver = worst.value.lt(0) ? (COST_LABELS[worst.key] ?? worst.key) : "нет убыточного компонента";
+
+  const totalCosts = input.fees.plus(input.slippage).plus(input.borrowCost).abs();
+  const costShareOfPnlPct = netPnl.eq(0) ? null : totalCosts.div(netPnl.abs()).times(100);
+
+  return { netPnl, returnPct, winRatePct, dominantLossDriver, costShareOfPnlPct };
 }
 
 export function formatReportFacts(data: TradeReportFacts, input: TradeReportInput): string {
