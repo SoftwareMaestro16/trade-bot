@@ -70,6 +70,13 @@ const LLM_KEYBOARD: InlineKeyboardMarkup = {
   ],
 };
 
+const STATUS_KEYBOARD: InlineKeyboardMarkup = {
+  inlineKeyboard: [
+    [{ text: "🔄 Обновить", callbackData: "status" }],
+    [{ text: "⬅️ Меню", callbackData: "menu" }],
+  ],
+};
+
 /** Пока грузятся асинхронные данные — только выход в меню. */
 const BACK_ONLY_KEYBOARD: InlineKeyboardMarkup = {
   inlineKeyboard: [[{ text: "⬅️ Меню", callbackData: "menu" }]],
@@ -98,10 +105,18 @@ const FLATTEN_CONFIRM_KEYBOARD: InlineKeyboardMarkup = {
 };
 
 export interface ButtonRouterDeps extends CommandRouterDeps {
-  /** Edits the tapped button's own message in place — see notify/telegram.ts's editMessageText. Pass {inlineKeyboard: []} to clear the buttons entirely. */
-  editMenuMessage: (messageId: number, text: string, keyboard: InlineKeyboardMarkup) => Promise<void>;
+  /**
+   * Edits the tapped button's own message in place — see notify/telegram.ts's
+   * editMessageText. Pass {inlineKeyboard: []} to clear the buttons entirely.
+   * `parseMode` для HTML-разделов (Статус/Помощь); опущен — plain-текст.
+   */
+  editMenuMessage: (messageId: number, text: string, keyboard: InlineKeyboardMarkup, parseMode?: "Markdown" | "HTML") => Promise<void>;
   /** MUST be called exactly once per callback_query — see notify/telegram.ts's answerCallbackQuery doc comment. */
   answerCallback: (callbackQueryId: string, toastText?: string) => Promise<void>;
+  /** Статус Фазы 1 в HTML для показа в меню на месте. Никогда не бросает. */
+  renderStatus: () => Promise<string>;
+  /** Список команд в HTML. Никогда не бросает. */
+  renderHelp: () => Promise<string>;
   /** Собирает и форматирует оценку рынка (без LLM). Никогда не бросает — на сбое отдаёт текст ошибки. */
   renderMarket: () => Promise<string>;
   /** То же + резюме LLM. При отсутствии/сбое LLM отдаёт оценку без резюме. */
@@ -121,6 +136,7 @@ async function showAsync(
   loadingText: string,
   render: () => Promise<string>,
   resultKeyboard: InlineKeyboardMarkup,
+  parseMode?: "Markdown" | "HTML",
 ): Promise<void> {
   await deps.editMenuMessage(messageId, loadingText, BACK_ONLY_KEYBOARD);
   let text: string;
@@ -128,9 +144,11 @@ async function showAsync(
     text = await render();
   } catch (e) {
     deps.logger.error({ err: e }, "async menu render threw");
-    text = "⚠️ Не удалось получить данные. Попробуйте ещё раз.";
+    // Ошибку показываем plain — HTML-фрагмент мог оборваться на середине тега.
+    await deps.editMenuMessage(messageId, "⚠️ Не удалось получить данные. Попробуйте ещё раз.", resultKeyboard);
+    return;
   }
-  await deps.editMenuMessage(messageId, text, resultKeyboard);
+  await deps.editMenuMessage(messageId, text, resultKeyboard, parseMode);
 }
 
 export async function routeCallbackQuery(
@@ -142,10 +160,13 @@ export async function routeCallbackQuery(
 ): Promise<void> {
   switch (data) {
     case "status":
-    case "help":
-      // Тяжёлый rich-отчёт отдельным сообщением — делегируем как типизированной команде.
-      routeAuthorizedCommand(data, [], chatId, deps);
       void deps.answerCallback(callbackQueryId);
+      await showAsync(deps, messageId, "⏳ Собираю статус…", deps.renderStatus, STATUS_KEYBOARD, "HTML");
+      return;
+
+    case "help":
+      void deps.answerCallback(callbackQueryId);
+      await showAsync(deps, messageId, "⏳ …", deps.renderHelp, BACK_ONLY_KEYBOARD, "HTML");
       return;
 
     case "menu":

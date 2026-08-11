@@ -20,13 +20,15 @@ import type { InlineKeyboardMarkup, TelegramConfig } from "./notify/telegram.js"
 import { deliverPending, enqueueNotification } from "./notify/notificationQueue.js";
 import { startCommandPolling } from "./notify/telegramPolling.js";
 import type { TelegramPollingHandle } from "./notify/telegramPolling.js";
-import { computeStatusReport, formatStatusReportTable } from "./notify/statusReport.js";
-import { formatHelpTable } from "./notify/helpText.js";
+import { computeStatusReport, formatStatusReportTable, formatStatusReport } from "./notify/statusReport.js";
+import { formatHelpTable, formatHelpText } from "./notify/helpText.js";
 import { scheduleRepeating } from "./scheduleRepeating.js";
 import type { ScheduledTask } from "./scheduleRepeating.js";
 import type { Database } from "./storage/schema.js";
 import { gatherMarketStats } from "./analysis/marketStats.js";
 import { assessMarket } from "./analysis/marketAssessment.js";
+import type { SymbolMarketStat } from "./analysis/marketAssessment.js";
+import { TtlCache } from "./analysis/ttlCache.js";
 import { formatAssessmentFacts } from "./analysis/llm/tools/marketAssessmentTool.js";
 import { computeOutlook, formatOutlookFacts } from "./analysis/llm/tools/opportunityOutlookTool.js";
 import { buildFallbackClient, buildToolset, buildHealthTargets } from "./analysis/llm/index.js";
@@ -278,10 +280,18 @@ async function main(): Promise<void> {
   }
 
   /** Edits the tapped button's own message in place — see buttonRouter.ts's ButtonRouterDeps. Never throws: a failed edit must not block the action routeCallbackQuery already took. */
-  async function editMenuMessage(messageId: number, text: string, keyboard: InlineKeyboardMarkup): Promise<void> {
+  async function editMenuMessage(
+    messageId: number,
+    text: string,
+    keyboard: InlineKeyboardMarkup,
+    parseMode?: "Markdown" | "HTML",
+  ): Promise<void> {
     if (!telegramConfig) return;
     try {
-      await editMessageText(telegramConfig, messageId, text, { replyMarkup: keyboard });
+      await editMessageText(telegramConfig, messageId, text, {
+        replyMarkup: keyboard,
+        ...(parseMode ? { parseMode } : {}),
+      });
     } catch (e) {
       logger.error({ err: e }, "failed to edit menu message");
     }
@@ -374,15 +384,22 @@ async function main(): Promise<void> {
     ].join("\n");
   }
 
+  // Кэш среза рынка на 5 минут: тап «📈 Рынок» не должен каждый раз бить три
+  // запроса по ~300 символам, а рынок за 5 минут ощутимо не меняется. Кэшируем
+  // именно сбор из БД (дорогой), а assessMarket поверх — чистый и дешёвый, его
+  // пересчитываем всегда. Резюме LLM тоже идёт от кэшированных stats.
+  const MARKET_CACHE_TTL_MS = 5 * 60 * 1000;
+  const marketStatsCache = new TtlCache<SymbolMarketStat[]>(MARKET_CACHE_TTL_MS);
+  const getMarketStats = (): Promise<SymbolMarketStat[]> =>
+    marketStatsCache.getOrCompute(() => gatherMarketStats(statusDb));
+
   async function renderMarket(): Promise<string> {
-    const stats = await gatherMarketStats(statusDb);
-    return marketText(assessMarket(stats));
+    return marketText(assessMarket(await getMarketStats()));
   }
 
   async function renderMarketLlm(): Promise<string> {
-    const stats = await gatherMarketStats(statusDb);
-    const assessment = assessMarket(stats);
-    const base = marketText(assessment);
+    const stats = await getMarketStats();
+    const base = marketText(assessMarket(stats));
     if (!toolset) return `${base}\n\n🧠 LLM не настроен (нет LLM_API_KEY).`;
     const result = await toolset.marketAssessment.run({ stats });
     return result.narrative
@@ -393,6 +410,16 @@ async function main(): Promise<void> {
   async function checkLlm(): Promise<string> {
     if (!llmHealthTargets) return formatHealthReport([]);
     return formatHealthReport(await checkLlmHealth(llmHealthTargets));
+  }
+
+  // Статус/Помощь в HTML для показа В МЕНЮ на месте (editMessage), в отличие от
+  // sendStatusReport/sendHelp, которые шлют rich-таблицу отдельным сообщением
+  // на типизированные /status, /help.
+  async function renderStatus(): Promise<string> {
+    return formatStatusReport(await computeStatusReport(statusDb, state));
+  }
+  function renderHelp(): Promise<string> {
+    return Promise.resolve(formatHelpText(COMMAND_DOCS));
   }
 
   // RR-33 (extended): only a chat_id that's either the root admin or already
@@ -421,6 +448,8 @@ async function main(): Promise<void> {
     ...commandRouterDeps,
     editMenuMessage,
     answerCallback,
+    renderStatus,
+    renderHelp,
     renderMarket,
     renderMarketLlm,
     checkLlm,

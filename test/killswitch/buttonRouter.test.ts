@@ -19,6 +19,8 @@ type MockedDeps = ButtonRouterDeps & {
   manageAuthorizedUser: ReturnType<typeof vi.fn>;
   editMenuMessage: ReturnType<typeof vi.fn>;
   answerCallback: ReturnType<typeof vi.fn>;
+  renderStatus: ReturnType<typeof vi.fn>;
+  renderHelp: ReturnType<typeof vi.fn>;
   renderMarket: ReturnType<typeof vi.fn>;
   renderMarketLlm: ReturnType<typeof vi.fn>;
   checkLlm: ReturnType<typeof vi.fn>;
@@ -40,6 +42,8 @@ function makeDeps(overrides?: Partial<ButtonRouterDeps>): MockedDeps {
     logger: makeLogger(),
     editMenuMessage: vi.fn().mockResolvedValue(undefined),
     answerCallback: vi.fn().mockResolvedValue(undefined),
+    renderStatus: vi.fn().mockResolvedValue("СТАТУС-HTML"),
+    renderHelp: vi.fn().mockResolvedValue("ПОМОЩЬ-HTML"),
     renderMarket: vi.fn().mockResolvedValue("РЫНОК-ТЕКСТ"),
     renderMarketLlm: vi.fn().mockResolvedValue("РЫНОК+LLM"),
     checkLlm: vi.fn().mockResolvedValue("LLM-ЗДОРОВЬЕ"),
@@ -85,19 +89,25 @@ describe("routeCallbackQuery — kill switch (без изменений пове
     vi.restoreAllMocks();
   });
 
-  it("'status': делегирует sendStatusReport, отвечает без тоста, не редактирует", () => {
+  it("'status': показывает renderStatus в меню (editMessage, HTML), не шлёт новое сообщение", async () => {
     const deps = makeDeps();
-    void routeCallbackQuery("status", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
-    expect(deps.sendStatusReport).toHaveBeenCalledTimes(1);
+    await routeCallbackQuery("status", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
+    expect(deps.sendStatusReport).not.toHaveBeenCalled(); // больше НЕ новое сообщение
+    expect(deps.renderStatus).toHaveBeenCalledTimes(1);
+    const calls = deps.editMenuMessage.mock.calls as [number, string, unknown, string | undefined][];
+    expect(calls[calls.length - 1]![1]).toBe("СТАТУС-HTML");
+    expect(calls[calls.length - 1]![3]).toBe("HTML"); // parseMode
     expect(deps.answerCallback).toHaveBeenCalledWith(CALLBACK_ID);
-    expect(deps.editMenuMessage).not.toHaveBeenCalled();
   });
 
-  it("'help': делегирует sendHelp, отвечает на callback", () => {
+  it("'help': показывает renderHelp в меню (editMessage, HTML)", async () => {
     const deps = makeDeps();
-    void routeCallbackQuery("help", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
-    expect(deps.sendHelp).toHaveBeenCalledTimes(1);
-    expect(deps.answerCallback).toHaveBeenCalledWith(CALLBACK_ID);
+    await routeCallbackQuery("help", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
+    expect(deps.sendHelp).not.toHaveBeenCalled();
+    expect(deps.renderHelp).toHaveBeenCalledTimes(1);
+    const calls = deps.editMenuMessage.mock.calls as [number, string, unknown, string | undefined][];
+    expect(calls[calls.length - 1]![1]).toBe("ПОМОЩЬ-HTML");
+    expect(calls[calls.length - 1]![3]).toBe("HTML");
   });
 
   it("'resume': снимает halt через applyAndPersist и правит на подтверждение с тостом", () => {
