@@ -3,8 +3,21 @@
  * клиент, инструменты, реестр. Публичный API держим здесь, чтобы внутренняя
  * раскладка файлов могла меняться без правок у потребителей.
  */
-export { OpenRouterClient, LlmError, LLM_ENDPOINT, DEFAULT_LLM_MODEL } from "./client.js";
+export {
+  OpenRouterClient,
+  FallbackLlmClient,
+  LlmError,
+  LLM_ENDPOINT,
+  DEFAULT_LLM_MODEL,
+  FALLBACK_LLM_MODEL,
+} from "./client.js";
 export type { LlmClient, LlmPrompt, OpenRouterConfig } from "./client.js";
+
+export { checkLlmHealth, formatHealthReport } from "./health.js";
+export type { NamedLlmClient, ModelHealth } from "./health.js";
+
+export { modelsFor, buildFallbackClient, buildHealthTargets } from "./factory.js";
+export type { LlmFactoryConfig } from "./factory.js";
 
 export { NarratingTool, RUSSIAN_ANALYST_SYSTEM_PROMPT } from "./tools/analysisTool.js";
 export type { AnalysisTool, Narrated } from "./tools/analysisTool.js";

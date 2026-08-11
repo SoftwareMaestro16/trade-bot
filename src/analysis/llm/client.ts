@@ -54,6 +54,14 @@ export class LlmError extends Error {
 
 export const LLM_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
 export const DEFAULT_LLM_MODEL = "nvidia/nemotron-3.5-lightning:free";
+/**
+ * Запасная модель на случай, когда основная отвалилась (лимит, 5xx, снятие с
+ * раздачи). Другой провайдер, тоже бесплатный маршрут OpenRouter, чтобы сбой у
+ * nvidia не оставлял отчёты без резюме. Подключается через FallbackLlmClient в
+ * точке композиции, а не внутри OpenRouterClient — транспорт остаётся про «один
+ * вызов одной модели», а стратегию перебора держит отдельный композит.
+ */
+export const FALLBACK_LLM_MODEL = "inclusionai/ling-3.0-tiny:free";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_TOKENS = 600;
 const DEFAULT_TEMPERATURE = 0.3;
@@ -138,5 +146,41 @@ export class OpenRouterClient implements LlmClient {
       throw new LlmError(`LLM вернул пустой ответ (HTTP ${String(response.status)})`, response.status);
     }
     return content.trim();
+  }
+}
+
+/**
+ * Композит из нескольких клиентов: пробует по порядку, отдаёт первый успех.
+ * Реализует тот же LlmClient (Liskov) — вызывающий не знает, что внутри
+ * перебор. Open/Closed: добавить ещё одну резервную модель — это ещё один
+ * элемент списка, класс не меняется. `onFallback` — необязательный хук для
+ * лога, чтобы было видно, когда основная модель отвалилась.
+ */
+export class FallbackLlmClient implements LlmClient {
+  constructor(
+    private readonly clients: readonly LlmClient[],
+    private readonly onFallback?: (failedIndex: number, error: LlmError) => void,
+  ) {
+    if (clients.length === 0) {
+      throw new Error("FallbackLlmClient требует хотя бы одного клиента");
+    }
+  }
+
+  async complete(prompt: LlmPrompt): Promise<string> {
+    let lastError: LlmError | undefined;
+    for (let i = 0; i < this.clients.length; i++) {
+      try {
+        return await this.clients[i]!.complete(prompt);
+      } catch (e) {
+        // Перебираем только на LlmError (сеть/лимит/битый ответ) — это ровно
+        // те сбои, ради которых резерв и нужен. Любое иное исключение (баг в
+        // коде) пробрасываем немедленно, не маскируя его перебором.
+        if (!(e instanceof LlmError)) throw e;
+        lastError = e;
+        if (i < this.clients.length - 1) this.onFallback?.(i, e);
+      }
+    }
+    // Все клиенты упали — отдаём последнюю ошибку, а не глотаем.
+    throw lastError ?? new LlmError("FallbackLlmClient: ни один клиент не ответил");
   }
 }
