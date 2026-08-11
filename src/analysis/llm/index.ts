@@ -9,7 +9,7 @@ export {
   LlmError,
   LLM_ENDPOINT,
   DEFAULT_LLM_MODEL,
-  FALLBACK_LLM_MODEL,
+  FALLBACK_LLM_MODELS,
 } from "./client.js";
 export type { LlmClient, LlmPrompt, OpenRouterConfig } from "./client.js";
 

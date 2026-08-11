@@ -2,7 +2,7 @@ import { pathToFileURL } from "node:url";
 import { loadEnv } from "../config/env.js";
 import { createDb } from "../storage/db.js";
 import { gatherMarketStats } from "../analysis/marketStats.js";
-import { OpenRouterClient, DEFAULT_LLM_MODEL, FALLBACK_LLM_MODEL } from "../analysis/llm/index.js";
+import { OpenRouterClient, DEFAULT_LLM_MODEL, FALLBACK_LLM_MODELS } from "../analysis/llm/index.js";
 import { buildToolset } from "../analysis/llm/index.js";
 
 /**
@@ -22,7 +22,7 @@ async function main(): Promise<void> {
   const db = createDb(env.DATABASE_URL);
   const stats = await gatherMarketStats(db);
 
-  for (const model of [DEFAULT_LLM_MODEL, FALLBACK_LLM_MODEL]) {
+  for (const model of [DEFAULT_LLM_MODEL, ...FALLBACK_LLM_MODELS]) {
     const toolset = buildToolset(new OpenRouterClient({ apiKey: env.LLM_API_KEY, model, requestTimeoutMs: 40_000 }));
     const started = Date.now();
     const result = await toolset.marketAssessment.run({ stats });

@@ -3,7 +3,7 @@ import {
   FallbackLlmClient,
   LlmError,
   DEFAULT_LLM_MODEL,
-  FALLBACK_LLM_MODEL,
+  FALLBACK_LLM_MODELS,
 } from "./client.js";
 import type { LlmClient } from "./client.js";
 import type { NamedLlmClient } from "./health.js";
@@ -24,10 +24,10 @@ export interface LlmFactoryConfig {
   onFallback?: (failedIndex: number, error: LlmError) => void;
 }
 
-/** Упорядоченный список моделей: основная, затем резервная (без дублей). */
+/** Упорядоченный список моделей: основная, затем резервные (без дублей, порядок сохранён). */
 export function modelsFor(config: LlmFactoryConfig): string[] {
   const primary = config.primaryModel ?? DEFAULT_LLM_MODEL;
-  return primary === FALLBACK_LLM_MODEL ? [primary] : [primary, FALLBACK_LLM_MODEL];
+  return [...new Set([primary, ...FALLBACK_LLM_MODELS])];
 }
 
 /**

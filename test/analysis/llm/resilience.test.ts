@@ -3,7 +3,7 @@ import { FallbackLlmClient, LlmError } from "../../../src/analysis/llm/client.js
 import type { LlmClient, LlmPrompt } from "../../../src/analysis/llm/client.js";
 import { checkLlmHealth, formatHealthReport } from "../../../src/analysis/llm/health.js";
 import { modelsFor, buildHealthTargets } from "../../../src/analysis/llm/factory.js";
-import { DEFAULT_LLM_MODEL, FALLBACK_LLM_MODEL } from "../../../src/analysis/llm/client.js";
+import { DEFAULT_LLM_MODEL, FALLBACK_LLM_MODELS } from "../../../src/analysis/llm/client.js";
 
 const PROMPT: LlmPrompt = { system: "s", user: "u" };
 
@@ -103,20 +103,23 @@ describe("checkLlmHealth / formatHealthReport", () => {
 });
 
 describe("factory — порядок и дедупликация моделей", () => {
-  it("по умолчанию основная + резервная", () => {
-    expect(modelsFor({ apiKey: "k" })).toEqual([DEFAULT_LLM_MODEL, FALLBACK_LLM_MODEL]);
+  it("по умолчанию основная + все резервные, по порядку", () => {
+    expect(modelsFor({ apiKey: "k" })).toEqual([DEFAULT_LLM_MODEL, ...FALLBACK_LLM_MODELS]);
   });
 
   it("уважает переопределение основной модели", () => {
-    expect(modelsFor({ apiKey: "k", primaryModel: "x/y" })).toEqual(["x/y", FALLBACK_LLM_MODEL]);
+    expect(modelsFor({ apiKey: "k", primaryModel: "x/y" })).toEqual(["x/y", ...FALLBACK_LLM_MODELS]);
   });
 
-  it("не дублирует, если основная и есть резервная", () => {
-    expect(modelsFor({ apiKey: "k", primaryModel: FALLBACK_LLM_MODEL })).toEqual([FALLBACK_LLM_MODEL]);
+  it("не дублирует, если основная совпала с одной из резервных", () => {
+    const dup = FALLBACK_LLM_MODELS[0]!;
+    const out = modelsFor({ apiKey: "k", primaryModel: dup });
+    expect(out[0]).toBe(dup);
+    expect(out.filter((m) => m === dup)).toHaveLength(1); // без дублей
   });
 
   it("buildHealthTargets даёт по цели на каждую модель", () => {
     const targets = buildHealthTargets({ apiKey: "k" });
-    expect(targets.map((t) => t.label)).toEqual([DEFAULT_LLM_MODEL, FALLBACK_LLM_MODEL]);
+    expect(targets.map((t) => t.label)).toEqual([DEFAULT_LLM_MODEL, ...FALLBACK_LLM_MODELS]);
   });
 });
