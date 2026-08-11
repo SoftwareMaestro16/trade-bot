@@ -1,6 +1,11 @@
 import Big from "big.js";
 
-const BASIS_DIVERGENCE_THRESHOLD = new Big("0.005"); // 0.5%, PARAMS-CONSERVATIVE.md §7.3
+/**
+ * 0.5%, PARAMS-CONSERVATIVE.md §7.3. Exported because risk/basisStability.ts's
+ * entry-side check measures how much room a candidate has before THIS stop —
+ * the two numbers must be the same number, not two copies that can drift.
+ */
+export const BASIS_DIVERGENCE_THRESHOLD = new Big("0.005");
 const APR_HYSTERESIS_FACTOR = "0.5"; // 50% of entry APR, PARAMS-CONSERVATIVE.md §7.2
 const MIN_FUNDING_PAYMENTS_FOR_PLANNED_EXIT = 1; // FR-303 (SRS.md)
 

@@ -1,4 +1,5 @@
 import Big from "big.js";
+import { sql } from "kysely";
 import type { Kysely } from "kysely";
 import type { Database } from "../../storage/schema.js";
 import type { OrderbookLevel } from "../../market-data/types.js";
@@ -149,4 +150,55 @@ export async function latestOpenInterestAtOrBefore(db: Kysely<Database>, symbol:
     .executeTakeFirst();
   if (!row) return undefined;
   return new Big(row.open_interest);
+}
+
+/**
+ * Trailing standard deviation of `(perpMark - spotLast) / spotLast` for one
+ * symbol over the `lookbackHours` ending at `t`, or null when there is too
+ * little history to characterise the basis. risk/basisStability.ts treats null
+ * as a denial rather than as calm.
+ *
+ * STRICTLY BACKWARD-LOOKING, like every other reader here: the window is
+ * `[t - lookbackHours, t)`. Computing this once over the whole scenario range
+ * would be far cheaper and completely invalid — it would let a symbol be judged
+ * calm using the very excursion that later stops the position out.
+ *
+ * Raw `sql` rather than the typed builder: the statistic is STDDEV_SAMP over a
+ * ratio of two joined columns, which kysely has no typed expression for, and
+ * spelling it out is clearer than fighting the builder for a number it will
+ * hand back as a string anyway.
+ *
+ * MIN_BASIS_SAMPLES guards the direction that matters: a deviation computed
+ * over a handful of ticks can read as implausibly calm, and for a fail-closed
+ * check the dangerous error is the one that ADMITS a symbol.
+ */
+const MIN_BASIS_SAMPLES = 30;
+
+export async function trailingBasisStdDev(
+  db: Kysely<Database>,
+  symbol: string,
+  t: Date,
+  lookbackHours = 24,
+): Promise<Big | null> {
+  const from = new Date(t.getTime() - lookbackHours * 60 * 60 * 1000);
+
+  const result = await sql<{ n: string; sd: string | null }>`
+    SELECT COUNT(*)::text AS n,
+           STDDEV_SAMP((perp.mark_price - spot.last_price) / spot.last_price)::text AS sd
+    FROM tickers perp
+    JOIN tickers spot
+      ON spot.symbol = perp.symbol
+     AND spot.fetched_at = perp.fetched_at
+     AND spot.category = 'spot'
+    WHERE perp.category = 'linear'
+      AND perp.symbol = ${symbol}
+      AND perp.fetched_at >= ${from}
+      AND perp.fetched_at < ${t}
+      AND perp.mark_price IS NOT NULL
+      AND spot.last_price > 0
+  `.execute(db);
+
+  const row = result.rows[0];
+  if (!row || Number(row.n) < MIN_BASIS_SAMPLES || row.sd === null) return null;
+  return new Big(row.sd);
 }

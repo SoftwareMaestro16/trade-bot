@@ -58,6 +58,13 @@ function goldenInput(): EntryCheckInput {
     nextFundingTimeMs: 1_000_000 + 10_000_000,
 
     isInnovationOrAdventureZone: false,
+
+    // Calm basis sitting at zero: 50 sigma of room to the 0.5% stop, so
+    // risk/basisStability.ts never fires in these composition tests unless a
+    // case deliberately overrides it.
+    currentBasis: new Big("0"),
+    basisStdDev: new Big("0.0001"),
+    exitBasisThreshold: new Big("0.005"),
   };
 }
 

@@ -1,5 +1,6 @@
 import type Big from "big.js";
 import { checkAccountMMRate, checkConcentration, checkLeverage, CONCENTRATION_MAX } from "./leverage.js";
+import { checkBasisStability, MIN_SIGMAS_TO_STOP } from "./basisStability.js";
 import { checkSlippage, checkTurnover, estimateSlippage, MIN_PERP_TURNOVER_24H, MIN_SPOT_TURNOVER_24H } from "./liquidity.js";
 import { checkEntryThreshold, checkFundingBlackout, checkNetFundingRate, isPremiumDriven, DEFAULT_FUNDING_REALIZATION_FACTOR } from "./economics.js";
 import type { VetoResult } from "./types.js";
@@ -40,6 +41,12 @@ export interface RiskThresholds {
    * what the old implicit 1.0 was costing.
    */
   fundingRealizationFactor: Big;
+  /**
+   * Standard deviations of basis room the emergency exit must leave before an
+   * entry is allowed — see risk/basisStability.ts for the trades that motivated
+   * it. Overridable so a sweep can show what each setting would have excluded.
+   */
+  minSigmasToStop: Big;
 }
 
 export const DEFAULT_RISK_THRESHOLDS: RiskThresholds = {
@@ -47,6 +54,7 @@ export const DEFAULT_RISK_THRESHOLDS: RiskThresholds = {
   minSpotTurnover24h: MIN_SPOT_TURNOVER_24H,
   maxConcentration: CONCENTRATION_MAX,
   fundingRealizationFactor: DEFAULT_FUNDING_REALIZATION_FACTOR,
+  minSigmasToStop: MIN_SIGMAS_TO_STOP,
 };
 
 /**
@@ -85,6 +93,13 @@ export interface EntryCheckInput {
   nextFundingTimeMs: number;
 
   isInnovationOrAdventureZone: boolean;
+
+  /** Basis at decision time, `(perpMark - spotLast) / spotLast`. */
+  currentBasis: Big;
+  /** Trailing standard deviation of that basis; null when unknown (denies). */
+  basisStdDev: Big | null;
+  /** strategy/exitRules.ts's BASIS_DIVERGENCE_THRESHOLD — the stop this measures room against. */
+  exitBasisThreshold: Big;
 }
 
 /**
@@ -120,6 +135,18 @@ export function checkEntry(input: EntryCheckInput, thresholds: RiskThresholds = 
       "Normalized premium index does not exceed +0.05%/8h — rate may be pinned to the clamp floor/cap, not a real signal (RISK-REGISTER.md FM-01).",
     );
   }
+
+  // Placed before the orderbook-dependent checks: it is pure arithmetic on
+  // values already in hand, and it rejects precisely the candidates that
+  // produced 92% of the sweep's losses, so paying for depth analysis on them
+  // first would be wasted work.
+  const basisStabilityResult = checkBasisStability(
+    input.currentBasis,
+    input.basisStdDev,
+    input.exitBasisThreshold,
+    thresholds.minSigmasToStop,
+  );
+  if (!basisStabilityResult.allowed) return basisStabilityResult;
 
   const entryThresholdResult = checkEntryThreshold(
     input.r8h,
@@ -173,3 +200,4 @@ export {
   DEFAULT_FUNDING_REALIZATION_FACTOR,
 } from "./economics.js";
 export { checkDrawdown, computeDrawdown } from "./drawdown.js";
+export { checkBasisStability, MIN_SIGMAS_TO_STOP } from "./basisStability.js";

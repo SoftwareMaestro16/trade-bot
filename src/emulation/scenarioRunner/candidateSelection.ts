@@ -5,12 +5,13 @@ import { checkEntry } from "../../risk/index.js";
 import { estimateSlippage, checkTurnover } from "../../risk/liquidity.js";
 import { computeTotalRoundTripCost } from "../../risk/totalRoundTripCost.js";
 import { rankCandidates, computeCandidateYield } from "../../strategy/rankCandidates.js";
+import { BASIS_DIVERGENCE_THRESHOLD } from "../../strategy/exitRules.js";
 import { sizePosition } from "../../strategy/sizing.js";
 import { normalizeFundingRateToR8h, REFERENCE_INTERVAL_MINUTES } from "../../market-data/normalizeFunding.js";
 import { latestLongShortRatioAtOrBefore } from "../../market-data/collectLongShortRatio.js";
 import { computeBorrowCost8h } from "../borrowCost.js";
 import { computeMaintenanceMargin, lookupMarginTier } from "../liquidation.js";
-import { latestPredictedFundingAtOrBefore, latestTickerAtOrBefore, orderbookSideAtOrBefore, latestOpenInterestAtOrBefore } from "./dbReaders.js";
+import { latestPredictedFundingAtOrBefore, latestTickerAtOrBefore, orderbookSideAtOrBefore, latestOpenInterestAtOrBefore, trailingBasisStdDev } from "./dbReaders.js";
 import { DEFAULT_PERP_QTY_STEP } from "./types.js";
 import type { ResolvedScenarioConfig, CandidateEvaluation } from "./types.js";
 
@@ -78,8 +79,14 @@ async function evaluateCandidate(
   if (!sized.allowed) return undefined;
   if (sized.perpQty.lte(0)) return undefined;
 
-  const perpBids = await orderbookSideAtOrBefore(db, symbol, "linear", "bid", t);
-  const spotAsks = await orderbookSideAtOrBefore(db, symbol, "spot", "ask", t);
+  // Fetched concurrently with the books: all three are independent reads, and
+  // the basis deviation is needed by checkEntry regardless of how the depth
+  // analysis turns out.
+  const [perpBids, spotAsks, basisStdDev] = await Promise.all([
+    orderbookSideAtOrBefore(db, symbol, "linear", "bid", t),
+    orderbookSideAtOrBefore(db, symbol, "spot", "ask", t),
+    trailingBasisStdDev(db, symbol, t),
+  ]);
 
   const entryPerpSlip = estimateSlippage(perpBids, targetNotional);
   const entrySpotSlip = estimateSlippage(spotAsks, targetNotional);
@@ -157,6 +164,9 @@ async function evaluateCandidate(
     nowMs: t.getTime(),
     nextFundingTimeMs: predicted.nextFundingTimeMs,
     isInnovationOrAdventureZone: false,
+    currentBasis,
+    basisStdDev,
+    exitBasisThreshold: BASIS_DIVERGENCE_THRESHOLD,
   }, resolved.riskThresholds);
 
   if (!veto.allowed) {
