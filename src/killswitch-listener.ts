@@ -25,6 +25,14 @@ import { formatHelpTable } from "./notify/helpText.js";
 import { scheduleRepeating } from "./scheduleRepeating.js";
 import type { ScheduledTask } from "./scheduleRepeating.js";
 import type { Database } from "./storage/schema.js";
+import { gatherMarketStats } from "./analysis/marketStats.js";
+import { assessMarket } from "./analysis/marketAssessment.js";
+import { formatAssessmentFacts } from "./analysis/llm/tools/marketAssessmentTool.js";
+import { computeOutlook, formatOutlookFacts } from "./analysis/llm/tools/opportunityOutlookTool.js";
+import { buildFallbackClient, buildToolset, buildHealthTargets } from "./analysis/llm/index.js";
+import type { Toolset } from "./analysis/llm/index.js";
+import { checkLlmHealth, formatHealthReport } from "./analysis/llm/index.js";
+import type { NamedLlmClient } from "./analysis/llm/index.js";
 
 const logger = rootLogger.child({ module: "killswitch-listener" });
 
@@ -335,6 +343,58 @@ async function main(): Promise<void> {
     }
   }
 
+  // LLM для аннотаций (резюме рынка + health-кнопка). Строится только при
+  // наличии ключа; без него кнопки честно сообщают «не настроен». Основная
+  // модель с авто-падением на резервную (analysis/llm/factory.ts). Строго вне
+  // торгового контура — только текст для Telegram.
+  const toolset: Toolset | null = env.LLM_API_KEY
+    ? buildToolset(
+        buildFallbackClient({
+          apiKey: env.LLM_API_KEY,
+          ...(env.LLM_MODEL ? { primaryModel: env.LLM_MODEL } : {}),
+          onFallback: (i, e) => logger.warn({ failedIndex: i, err: e.message }, "LLM: переход на резервную модель"),
+        }),
+      )
+    : null;
+  const llmHealthTargets: NamedLlmClient[] | null = env.LLM_API_KEY
+    ? buildHealthTargets({ apiKey: env.LLM_API_KEY, ...(env.LLM_MODEL ? { primaryModel: env.LLM_MODEL } : {}) })
+    : null;
+
+  // Оценка рынка + перспектива в plain-text для editMessage (editMenuMessage
+  // шлёт без parse_mode). Вся арифметика — в протестированных assessMarket/
+  // computeOutlook; здесь только сборка строки.
+  function marketText(assessment: ReturnType<typeof assessMarket>): string {
+    return [
+      "📈 Оценка рынка",
+      "",
+      formatAssessmentFacts(assessment),
+      "",
+      "Перспектива:",
+      formatOutlookFacts(computeOutlook(assessment)),
+    ].join("\n");
+  }
+
+  async function renderMarket(): Promise<string> {
+    const stats = await gatherMarketStats(statusDb);
+    return marketText(assessMarket(stats));
+  }
+
+  async function renderMarketLlm(): Promise<string> {
+    const stats = await gatherMarketStats(statusDb);
+    const assessment = assessMarket(stats);
+    const base = marketText(assessment);
+    if (!toolset) return `${base}\n\n🧠 LLM не настроен (нет LLM_API_KEY).`;
+    const result = await toolset.marketAssessment.run({ stats });
+    return result.narrative
+      ? `${base}\n\n🧠 ${result.narrative}`
+      : `${base}\n\n🧠 Резюме недоступно: ${result.llmError ?? "н/д"}`;
+  }
+
+  async function checkLlm(): Promise<string> {
+    if (!llmHealthTargets) return formatHealthReport([]);
+    return formatHealthReport(await checkLlmHealth(llmHealthTargets));
+  }
+
   // RR-33 (extended): only a chat_id that's either the root admin or already
   // in the authorized_users table ever reaches routeAuthorizedCommand at
   // all — isAuthorizedChat/authorizeCommand have already filtered by the
@@ -361,6 +421,9 @@ async function main(): Promise<void> {
     ...commandRouterDeps,
     editMenuMessage,
     answerCallback,
+    renderMarket,
+    renderMarketLlm,
+    checkLlm,
   };
 
   // Owner's own request ("мемпул", verbatim: once the process "comes back to
@@ -425,7 +488,10 @@ async function main(): Promise<void> {
           void answerCallback(cq.callbackQueryId);
           return;
         }
-        routeCallbackQuery(cq.auth.command, cq.auth.chatId, cq.messageId, cq.callbackQueryId, buttonRouterDeps);
+        // async: собственные ошибки роутер уже глушит (showAsync ловит render,
+        // editMenuMessage/answerCallback не бросают), поэтому floating promise
+        // здесь безопасен — но void явно, чтобы это было видно.
+        void routeCallbackQuery(cq.auth.command, cq.auth.chatId, cq.messageId, cq.callbackQueryId, buttonRouterDeps);
       },
     );
     logger.info("Telegram command polling started");

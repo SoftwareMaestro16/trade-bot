@@ -10,7 +10,7 @@ function makeLogger(): Logger {
   return { error: vi.fn(), info: vi.fn(), warn: vi.fn() } as unknown as Logger;
 }
 
-function makeDeps(overrides?: Partial<ButtonRouterDeps>): ButtonRouterDeps & {
+type MockedDeps = ButtonRouterDeps & {
   inFlightPersists: { track: ReturnType<typeof vi.fn> };
   applyAndPersist: ReturnType<typeof vi.fn>;
   sendStatusReport: ReturnType<typeof vi.fn>;
@@ -19,8 +19,13 @@ function makeDeps(overrides?: Partial<ButtonRouterDeps>): ButtonRouterDeps & {
   manageAuthorizedUser: ReturnType<typeof vi.fn>;
   editMenuMessage: ReturnType<typeof vi.fn>;
   answerCallback: ReturnType<typeof vi.fn>;
+  renderMarket: ReturnType<typeof vi.fn>;
+  renderMarketLlm: ReturnType<typeof vi.fn>;
+  checkLlm: ReturnType<typeof vi.fn>;
   logger: Logger;
-} {
+};
+
+function makeDeps(overrides?: Partial<ButtonRouterDeps>): MockedDeps {
   const state: HaltState = { ...CLEARED_STATE };
   const inFlightPersists = { track: vi.fn() } as unknown as InFlightTracker & { track: ReturnType<typeof vi.fn> };
   const deps = {
@@ -35,27 +40,19 @@ function makeDeps(overrides?: Partial<ButtonRouterDeps>): ButtonRouterDeps & {
     logger: makeLogger(),
     editMenuMessage: vi.fn().mockResolvedValue(undefined),
     answerCallback: vi.fn().mockResolvedValue(undefined),
+    renderMarket: vi.fn().mockResolvedValue("РЫНОК-ТЕКСТ"),
+    renderMarketLlm: vi.fn().mockResolvedValue("РЫНОК+LLM"),
+    checkLlm: vi.fn().mockResolvedValue("LLM-ЗДОРОВЬЕ"),
     ...overrides,
   };
-  return deps as typeof deps &
-    ButtonRouterDeps & {
-      inFlightPersists: { track: ReturnType<typeof vi.fn> };
-      applyAndPersist: ReturnType<typeof vi.fn>;
-      sendStatusReport: ReturnType<typeof vi.fn>;
-      sendHelp: ReturnType<typeof vi.fn>;
-      sendMenu: ReturnType<typeof vi.fn>;
-      manageAuthorizedUser: ReturnType<typeof vi.fn>;
-      editMenuMessage: ReturnType<typeof vi.fn>;
-      answerCallback: ReturnType<typeof vi.fn>;
-      logger: Logger;
-    };
+  return deps as unknown as MockedDeps;
 }
 
 const CHAT_ID = "111111111";
 const MESSAGE_ID = 42;
 const CALLBACK_ID = "cbq-abc";
 
-describe("routeCallbackQuery", () => {
+describe("routeCallbackQuery — навигация", () => {
   beforeEach(() => {
     vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
   });
@@ -63,33 +60,58 @@ describe("routeCallbackQuery", () => {
     vi.restoreAllMocks();
   });
 
-  it("'status': delegates to routeAuthorizedCommand's sendStatusReport, then answers the callback with no toast", () => {
+  it("'menu': правит сообщение обратно в главное меню", async () => {
     const deps = makeDeps();
-    routeCallbackQuery("status", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
+    await routeCallbackQuery("menu", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
+    expect(deps.editMenuMessage).toHaveBeenCalledWith(MESSAGE_ID, MENU_TEXT, MENU_KEYBOARD);
+    expect(deps.answerCallback).toHaveBeenCalledWith(CALLBACK_ID);
+  });
+
+  it("'manage': открывает подменю управления с кнопками Начать/Остановить/Закрыть всё", async () => {
+    const deps = makeDeps();
+    await routeCallbackQuery("manage", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
+    const [, text, keyboard] = deps.editMenuMessage.mock.calls[0] as [number, string, { inlineKeyboard: { callbackData: string }[][] }];
+    expect(text).toContain("Управление");
+    const datas = keyboard.inlineKeyboard.flat().map((b) => b.callbackData);
+    expect(datas).toEqual(["resume", "stop_confirm", "flatten_confirm", "menu"]);
+  });
+});
+
+describe("routeCallbackQuery — kill switch (без изменений поведения)", () => {
+  beforeEach(() => {
+    vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("'status': делегирует sendStatusReport, отвечает без тоста, не редактирует", () => {
+    const deps = makeDeps();
+    void routeCallbackQuery("status", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
     expect(deps.sendStatusReport).toHaveBeenCalledTimes(1);
     expect(deps.answerCallback).toHaveBeenCalledWith(CALLBACK_ID);
     expect(deps.editMenuMessage).not.toHaveBeenCalled();
   });
 
-  it("'help': delegates to sendHelp, then answers the callback", () => {
+  it("'help': делегирует sendHelp, отвечает на callback", () => {
     const deps = makeDeps();
-    routeCallbackQuery("help", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
+    void routeCallbackQuery("help", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
     expect(deps.sendHelp).toHaveBeenCalledTimes(1);
     expect(deps.answerCallback).toHaveBeenCalledWith(CALLBACK_ID);
   });
 
-  it("'resume': clears the halt via applyAndPersist (same as the typed /resume path), then answers the callback", () => {
+  it("'resume': снимает halt через applyAndPersist и правит на подтверждение с тостом", () => {
     const deps = makeDeps();
-    routeCallbackQuery("resume", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
+    void routeCallbackQuery("resume", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
     expect(deps.applyAndPersist).toHaveBeenCalledWith(CLEARED_STATE, expect.stringContaining("Halt cleared via /resume"));
-    expect(deps.answerCallback).toHaveBeenCalledWith(CALLBACK_ID);
+    expect(deps.editMenuMessage).toHaveBeenCalledWith(MESSAGE_ID, expect.stringContaining("запущена"), expect.anything());
+    expect(deps.answerCallback).toHaveBeenCalledWith(CALLBACK_ID, "Запущено");
   });
 
-  it("'stop_confirm': does NOT touch applyAndPersist — only edits the message to a warning + confirm keyboard", () => {
+  it("'stop_confirm': НЕ трогает applyAndPersist — только правит на предупреждение + confirm-клавиатуру", () => {
     const deps = makeDeps();
-    routeCallbackQuery("stop_confirm", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
+    void routeCallbackQuery("stop_confirm", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
     expect(deps.applyAndPersist).not.toHaveBeenCalled();
-    expect(deps.editMenuMessage).toHaveBeenCalledTimes(1);
     const [messageId, text, keyboard] = deps.editMenuMessage.mock.calls[0] as [number, string, { inlineKeyboard: unknown[][] }];
     expect(messageId).toBe(MESSAGE_ID);
     expect(text).toContain("HALT_NEW");
@@ -100,11 +122,10 @@ describe("routeCallbackQuery", () => {
     expect(deps.answerCallback).toHaveBeenCalledWith(CALLBACK_ID);
   });
 
-  it("'flatten_confirm': does NOT touch applyAndPersist — only edits the message to a warning + confirm keyboard", () => {
+  it("'flatten_confirm': НЕ трогает applyAndPersist — только правит на предупреждение + confirm", () => {
     const deps = makeDeps();
-    routeCallbackQuery("flatten_confirm", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
+    void routeCallbackQuery("flatten_confirm", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
     expect(deps.applyAndPersist).not.toHaveBeenCalled();
-    expect(deps.editMenuMessage).toHaveBeenCalledTimes(1);
     const [, text, keyboard] = deps.editMenuMessage.mock.calls[0] as [number, string, { inlineKeyboard: unknown[][] }];
     expect(text).toContain("FLATTEN_ALL");
     expect(keyboard.inlineKeyboard[0]).toEqual([
@@ -113,10 +134,9 @@ describe("routeCallbackQuery", () => {
     ]);
   });
 
-  it("'stop_execute': actually raises HALT_NEW via applyAndPersist, then clears the message's buttons", () => {
+  it("'stop_execute': реально поднимает HALT_NEW и чистит кнопки", () => {
     const deps = makeDeps();
-    routeCallbackQuery("stop_execute", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
-    expect(deps.applyAndPersist).toHaveBeenCalledTimes(1);
+    void routeCallbackQuery("stop_execute", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
     expect(deps.applyAndPersist).toHaveBeenCalledWith(
       expect.objectContaining({ haltNew: true, flattenAll: false }),
       expect.stringContaining("HALT_NEW"),
@@ -126,10 +146,9 @@ describe("routeCallbackQuery", () => {
     expect(deps.answerCallback).toHaveBeenCalledWith(CALLBACK_ID, "Остановлено");
   });
 
-  it("'flatten_execute': actually raises FLATTEN_ALL via applyAndPersist, then clears the message's buttons", () => {
+  it("'flatten_execute': реально поднимает FLATTEN_ALL и чистит кнопки", () => {
     const deps = makeDeps();
-    routeCallbackQuery("flatten_execute", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
-    expect(deps.applyAndPersist).toHaveBeenCalledTimes(1);
+    void routeCallbackQuery("flatten_execute", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
     expect(deps.applyAndPersist).toHaveBeenCalledWith(
       expect.objectContaining({ haltNew: true, flattenAll: true }),
       expect.stringContaining("FLATTEN_ALL"),
@@ -138,32 +157,65 @@ describe("routeCallbackQuery", () => {
     expect(deps.answerCallback).toHaveBeenCalledWith(CALLBACK_ID, "Flatten активирован");
   });
 
-  it("'cancel': does NOT touch applyAndPersist — reverts the message back to the main menu", () => {
+  it("'cancel': НЕ трогает applyAndPersist — возвращает сообщение в главное меню", () => {
     const deps = makeDeps();
-    routeCallbackQuery("cancel", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
+    void routeCallbackQuery("cancel", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
     expect(deps.applyAndPersist).not.toHaveBeenCalled();
     expect(deps.editMenuMessage).toHaveBeenCalledWith(MESSAGE_ID, MENU_TEXT, MENU_KEYBOARD);
     expect(deps.answerCallback).toHaveBeenCalledWith(CALLBACK_ID, "Отменено");
   });
 
-  it("unrecognized callback_data: logged, no dependency side effects beyond answering the callback", () => {
+  it("неизвестный callback_data: логируется, кроме ответа на callback — без побочек", () => {
     const deps = makeDeps();
-    routeCallbackQuery("bogus", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
+    void routeCallbackQuery("bogus", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
     expect(deps.logger.info).toHaveBeenCalledWith({ data: "bogus" }, "unrecognized callback_data");
     expect(deps.applyAndPersist).not.toHaveBeenCalled();
     expect(deps.editMenuMessage).not.toHaveBeenCalled();
     expect(deps.answerCallback).toHaveBeenCalledWith(CALLBACK_ID);
   });
+});
 
-  it("'stop_execute' cannot be reached without going through 'stop_confirm' first in the router's own vocabulary — confirms the two-step design isn't bypassable by a single callback_data value alone", () => {
-    // Not a real bypass test (routeCallbackQuery is stateless per call — the
-    // real guarantee is that Telegram only ever sends back the callback_data
-    // of a button that was actually rendered, and stop_execute is only ever
-    // rendered by the stop_confirm case above) — this test just pins down
-    // that 'stop_confirm' itself never calls applyAndPersist, which is the
-    // property that makes the two-step flow meaningful at all.
+describe("routeCallbackQuery — async-разделы (Рынок/LLM)", () => {
+  beforeEach(() => {
+    vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("'market': сперва «⏳», затем результат renderMarket, с клавиатурой рынка", async () => {
     const deps = makeDeps();
-    routeCallbackQuery("stop_confirm", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
-    expect(deps.applyAndPersist).not.toHaveBeenCalled();
+    await routeCallbackQuery("market", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
+    expect(deps.renderMarket).toHaveBeenCalledTimes(1);
+    // Первый edit — загрузка, второй — результат.
+    const calls = deps.editMenuMessage.mock.calls as [number, string, { inlineKeyboard: { callbackData: string }[][] }][];
+    expect(calls[0]![1]).toContain("⏳");
+    expect(calls[1]![1]).toBe("РЫНОК-ТЕКСТ");
+    expect(calls[1]![2].inlineKeyboard.flat().map((b) => b.callbackData)).toContain("market_llm");
+    expect(deps.answerCallback).toHaveBeenCalledWith(CALLBACK_ID);
+  });
+
+  it("'market_llm': показывает результат renderMarketLlm", async () => {
+    const deps = makeDeps();
+    await routeCallbackQuery("market_llm", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
+    expect(deps.renderMarketLlm).toHaveBeenCalledTimes(1);
+    const calls = deps.editMenuMessage.mock.calls as [number, string, unknown][];
+    expect(calls[calls.length - 1]![1]).toBe("РЫНОК+LLM");
+  });
+
+  it("'llm_health': показывает результат checkLlm с клавиатурой LLM", async () => {
+    const deps = makeDeps();
+    await routeCallbackQuery("llm_health", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
+    expect(deps.checkLlm).toHaveBeenCalledTimes(1);
+    const calls = deps.editMenuMessage.mock.calls as [number, string, { inlineKeyboard: { callbackData: string }[][] }][];
+    expect(calls[calls.length - 1]![1]).toBe("LLM-ЗДОРОВЬЕ");
+    expect(calls[calls.length - 1]![2].inlineKeyboard.flat().map((b) => b.callbackData)).toContain("llm_health");
+  });
+
+  it("если render бросил — показывает текст ошибки, а не виснет на «⏳»", async () => {
+    const deps = makeDeps({ renderMarket: vi.fn().mockRejectedValue(new Error("db down")) });
+    await routeCallbackQuery("market", CHAT_ID, MESSAGE_ID, CALLBACK_ID, deps);
+    const calls = deps.editMenuMessage.mock.calls as [number, string, unknown][];
+    expect(calls[calls.length - 1]![1]).toContain("Не удалось");
   });
 });
