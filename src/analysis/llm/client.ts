@@ -53,18 +53,43 @@ export class LlmError extends Error {
 }
 
 export const LLM_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
-export const DEFAULT_LLM_MODEL = "nvidia/nemotron-3.5-lightning:free";
+/**
+ * Основная модель. Выбрана эмпирически (2026-08-11): nvidia/nemotron-3.5-
+ * lightning оказалась «думающей» — сыпала ход рассуждений по-английски прямо в
+ * ответ, игнорируя и жёсткий промпт, и reasoning.exclude (её рассуждения без
+ * тегов, strip их не ловит). ling-3.0-tiny на том же промпте даёт короткое
+ * чистое русское резюме — поэтому она основная.
+ */
+export const DEFAULT_LLM_MODEL = "inclusionai/ling-3.0-tiny:free";
 /**
  * Запасная модель на случай, когда основная отвалилась (лимит, 5xx, снятие с
- * раздачи). Другой провайдер, тоже бесплатный маршрут OpenRouter, чтобы сбой у
- * nvidia не оставлял отчёты без резюме. Подключается через FallbackLlmClient в
- * точке композиции, а не внутри OpenRouterClient — транспорт остаётся про «один
- * вызов одной модели», а стратегию перебора держит отдельный композит.
+ * раздачи) — ДРУГОЙ провайдер, тоже бесплатный instruct-маршрут OpenRouter, и
+ * тоже без «мыслей вслух». Специально НЕ nemotron: падать на модель, которая
+ * выдаёт мусор, хуже, чем показать рынок без резюме. Подключается через
+ * FallbackLlmClient в точке композиции.
  */
-export const FALLBACK_LLM_MODEL = "inclusionai/ling-3.0-tiny:free";
+export const FALLBACK_LLM_MODEL = "google/gemma-4-31b-it:free";
 const DEFAULT_TIMEOUT_MS = 30_000;
-const DEFAULT_MAX_TOKENS = 600;
+// Headroom так, что даже «думающая» модель, слившая часть бюджета на
+// рассуждения, всё равно дойдёт до финального ответа — иначе ответ обрывается
+// на полуслове (наблюдалось у nemotron 2026-08-11).
+const DEFAULT_MAX_TOKENS = 900;
 const DEFAULT_TEMPERATURE = 0.3;
+
+/**
+ * Убирает «мысли вслух» из ответа: reasoning-модели заворачивают рассуждения в
+ * теги <think>/<thinking>/<reasoning> и выдают их в content. Показывать это
+ * пользователю нельзя — режем блоки, оставляя только финал. Чистая функция,
+ * экспортирована для теста. Не панацея против моделей, которые сыплют
+ * рассуждениями без тегов вообще — от таких спасает выбор модели и промпт.
+ */
+export function stripReasoningBlocks(text: string): string {
+  return text
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/<thinking>[\s\S]*?<\/thinking>/gi, "")
+    .replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, "")
+    .trim();
+}
 
 export interface OpenRouterConfig {
   apiKey: string;
@@ -114,6 +139,10 @@ export class OpenRouterClient implements LlmClient {
           ],
           max_tokens: this.config.maxTokens ?? DEFAULT_MAX_TOKENS,
           temperature: this.config.temperature ?? DEFAULT_TEMPERATURE,
+          // OpenRouter: для reasoning-моделей не возвращать токены рассуждений —
+          // нам нужен только финальный ответ. Модели без reasoning параметр
+          // игнорируют, так что это безопасно на любом маршруте.
+          reasoning: { exclude: true },
         }),
         signal: controller.signal,
       });
@@ -145,7 +174,13 @@ export class OpenRouterClient implements LlmClient {
     if (typeof content !== "string" || content.trim().length === 0) {
       throw new LlmError(`LLM вернул пустой ответ (HTTP ${String(response.status)})`, response.status);
     }
-    return content.trim();
+    const cleaned = stripReasoningBlocks(content);
+    // Если после вырезания тегов не осталось ничего (весь ответ был
+    // рассуждением) — это тоже пустой ответ, а не молча возвращаемая пустышка.
+    if (cleaned.length === 0) {
+      throw new LlmError(`LLM вернул только рассуждения, без ответа (HTTP ${String(response.status)})`, response.status);
+    }
+    return cleaned;
   }
 }
 

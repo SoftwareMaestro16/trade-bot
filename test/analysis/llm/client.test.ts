@@ -1,6 +1,6 @@
 import nock from "nock";
 import { afterEach, describe, expect, it } from "vitest";
-import { OpenRouterClient, LlmError, DEFAULT_LLM_MODEL } from "../../../src/analysis/llm/client.js";
+import { OpenRouterClient, LlmError, DEFAULT_LLM_MODEL, stripReasoningBlocks } from "../../../src/analysis/llm/client.js";
 import type { LlmPrompt } from "../../../src/analysis/llm/client.js";
 
 const LLM_HOST = "https://openrouter.ai";
@@ -73,5 +73,47 @@ describe("OpenRouterClient.complete", () => {
   it("бросает LlmError по таймауту, если эндпоинт завис", async () => {
     nock(LLM_HOST).post(LLM_PATH).delay(1500).reply(200, { choices: [{ message: { content: "поздно" } }] });
     await expect(client().complete(PROMPT)).rejects.toMatchObject({ name: "LlmError" });
+  });
+
+  it("вырезает <think>-блоки из ответа модели", async () => {
+    nock(LLM_HOST)
+      .post(LLM_PATH)
+      .reply(200, { choices: [{ message: { content: "<think>долго думаю по-английски</think>\nРынок вялый." } }] });
+    expect(await client().complete(PROMPT)).toBe("Рынок вялый.");
+  });
+
+  it("бросает LlmError, если после вырезания рассуждений не осталось ответа", async () => {
+    nock(LLM_HOST)
+      .post(LLM_PATH)
+      .reply(200, { choices: [{ message: { content: "<think>только мысли, ответа нет</think>" } }] });
+    await expect(client().complete(PROMPT)).rejects.toBeInstanceOf(LlmError);
+  });
+
+  it("шлёт reasoning.exclude, чтобы reasoning-модели не возвращали мысли", async () => {
+    let sentReasoning: unknown;
+    nock(LLM_HOST)
+      .post(LLM_PATH, (b: { reasoning?: unknown }) => {
+        sentReasoning = b.reasoning;
+        return true;
+      })
+      .reply(200, { choices: [{ message: { content: "ок" } }] });
+    await client().complete(PROMPT);
+    expect(sentReasoning).toEqual({ exclude: true });
+  });
+});
+
+describe("stripReasoningBlocks", () => {
+  it("оставляет обычный текст нетронутым", () => {
+    expect(stripReasoningBlocks("Рынок вялый.")).toBe("Рынок вялый.");
+  });
+
+  it("режет <think>, <thinking>, <reasoning> регистронезависимо", () => {
+    expect(stripReasoningBlocks("<THINK>x</THINK>Ответ")).toBe("Ответ");
+    expect(stripReasoningBlocks("<thinking>y</thinking>\n\nОтвет")).toBe("Ответ");
+    expect(stripReasoningBlocks("<reasoning>z</reasoning> Ответ")).toBe("Ответ");
+  });
+
+  it("возвращает пустую строку, если весь текст был рассуждением", () => {
+    expect(stripReasoningBlocks("<think>всё сюда</think>")).toBe("");
   });
 });
