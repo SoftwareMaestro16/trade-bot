@@ -7,9 +7,10 @@ import { generateReports } from "../emulation/reportGenerator.js";
 import { runScenario } from "../emulation/scenarioRunner.js";
 import type { ScenarioConfig } from "../emulation/scenarioRunner.js";
 import { createDb } from "../storage/db.js";
-import { sendDocument, sendAlert } from "../notify/telegram.js";
+import { sendDocument, sendAlert, truncateCaption } from "../notify/telegram.js";
 import { resolveObservedRange, computeCoverageHours } from "./runEmulationScenario.js";
 import { notionalForCapital } from "../strategy/capitalAllocation.js";
+import { buildCombinedReport } from "../emulation/reportDelivery.js";
 
 /**
  * One-off, manually-run parameter sweep — NOT part of collector.ts's schedule,
@@ -358,36 +359,28 @@ async function runOne(
   const runId = `${name}-${String(result.scenarioId)}`;
   const reports = await generateReports(db, runId, [result.scenarioId]);
 
+  // Один файл вместо трёх (как в runEmulationScenario). Подпись оставляем
+  // sweep-специфичной (buildSweepCaption) — в ней гипотеза конфигурации,
+  // которой LLM не знает; для research-прогона это ценнее авто-резюме.
+  const combined = buildCombinedReport(runId, reports);
   await mkdir(REPORTS_DIR, { recursive: true });
-  const summaryPath = path.join(REPORTS_DIR, `paper_summary_${runId}.md`);
-  const tradesPath = path.join(REPORTS_DIR, `paper_trades_${runId}.csv`);
-  const equityPath = path.join(REPORTS_DIR, `paper_equity_curve_${runId}.csv`);
-  await writeFile(summaryPath, reports.summaryMarkdown, "utf8");
-  await writeFile(tradesPath, reports.tradesCsv, "utf8");
-  await writeFile(equityPath, reports.equityCurveCsv, "utf8");
+  await writeFile(path.join(REPORTS_DIR, combined.filename), combined.content, "utf8");
 
   if (telegram) {
     // Delivery is isolated from the result on purpose. An hour of computation
     // is already complete and written to REPORTS_DIR by this point, so letting
     // a Telegram-side failure propagate would discard a finished experiment
     // over a transport problem — which is exactly what a 400 "caption is too
-    // long" did to this sweep's first config on 2026-08-10. The files stay on
+    // long" did to this sweep's first config on 2026-08-10. The file stays on
     // disk either way and can be re-sent by hand.
     try {
-      const caption = buildSweepCaption(
-        cfg,
-        runId,
-        result.finalEquity,
-        result.positionsOpened,
-        result.positionsClosed,
-        coverageHours,
+      const caption = truncateCaption(
+        buildSweepCaption(cfg, runId, result.finalEquity, result.positionsOpened, result.positionsClosed, coverageHours),
       );
-      await sendDocument(telegram, `paper_summary_${runId}.md`, reports.summaryMarkdown, { caption });
-      await sendDocument(telegram, `paper_trades_${runId}.csv`, reports.tradesCsv);
-      await sendDocument(telegram, `paper_equity_curve_${runId}.csv`, reports.equityCurveCsv);
-      console.log(`[sweep] ${cfg.key}: reports sent to Telegram`);
+      await sendDocument(telegram, combined.filename, combined.content, { caption });
+      console.log(`[sweep] ${cfg.key}: single report file sent to Telegram`);
     } catch (e) {
-      console.error(`[sweep] ${cfg.key}: report DELIVERY failed (result is safe, files in ${REPORTS_DIR}):`, e);
+      console.error(`[sweep] ${cfg.key}: report DELIVERY failed (result is safe, file in ${REPORTS_DIR}):`, e);
     }
   }
 
