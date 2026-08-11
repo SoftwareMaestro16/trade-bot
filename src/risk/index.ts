@@ -1,6 +1,7 @@
 import type Big from "big.js";
 import { checkAccountMMRate, checkConcentration, checkLeverage, CONCENTRATION_MAX } from "./leverage.js";
 import { checkBasisStability, MIN_SIGMAS_TO_STOP } from "./basisStability.js";
+import { checkDelisting } from "./delisting.js";
 import { checkSlippage, checkTurnover, estimateSlippage, MIN_PERP_TURNOVER_24H, MIN_SPOT_TURNOVER_24H } from "./liquidity.js";
 import { checkEntryThreshold, checkFundingBlackout, checkNetFundingRate, isPremiumDriven, DEFAULT_FUNDING_REALIZATION_FACTOR } from "./economics.js";
 import type { VetoResult } from "./types.js";
@@ -94,6 +95,9 @@ export interface EntryCheckInput {
 
   isInnovationOrAdventureZone: boolean;
 
+  /** instruments-info.deliveryTime (мс); 0 у обычного перпетуала, ненулевое = назначен делистинг/поставка (см. risk/delisting.ts). */
+  deliveryTimeMs: number;
+
   /** Basis at decision time, `(perpMark - spotLast) / spotLast`. */
   currentBasis: Big;
   /** Trailing standard deviation of that basis; null when unknown (denies). */
@@ -120,6 +124,12 @@ export function checkEntry(input: EntryCheckInput, thresholds: RiskThresholds = 
       "Symbol is in Innovation or Adventure Zone — excluded entirely (PARAMS-CONSERVATIVE.md §4).",
     );
   }
+
+  // Жёсткое исключение рядом с зоной: не входить в пару с назначенным
+  // делистингом/поставкой — её принудительно закроют на settlement. Дёшево
+  // (арифметика), поэтому в начале цепочки.
+  const delistingResult = checkDelisting(input.deliveryTimeMs, input.nowMs);
+  if (!delistingResult.allowed) return delistingResult;
 
   const turnoverResult = checkTurnover(
     input.perpTurnover24h,
@@ -201,3 +211,4 @@ export {
 } from "./economics.js";
 export { checkDrawdown, computeDrawdown } from "./drawdown.js";
 export { checkBasisStability, MIN_SIGMAS_TO_STOP } from "./basisStability.js";
+export { checkDelisting, DEFAULT_DELISTING_BLOCK_WINDOW_MS } from "./delisting.js";

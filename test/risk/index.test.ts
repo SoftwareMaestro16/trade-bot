@@ -65,6 +65,10 @@ function goldenInput(): EntryCheckInput {
     currentBasis: new Big("0"),
     basisStdDev: new Big("0.0001"),
     exitBasisThreshold: new Big("0.005"),
+
+    // Обычный перпетуал без делистинга — risk/delisting.ts не срабатывает,
+    // если кейс явно не переопределит deliveryTimeMs.
+    deliveryTimeMs: 0,
   };
 }
 
@@ -77,6 +81,11 @@ describe("checkEntry — composition of all risk/ vetoes", () => {
   it("denies on zone exclusion before evaluating anything else", () => {
     const result = checkEntry({ ...goldenInput(), isInnovationOrAdventureZone: true });
     expect(result).toMatchObject({ allowed: false, code: "ZONE_EXCLUDED" });
+  });
+
+  it("denies a pair with a scheduled delisting (deliveryTime within the window)", () => {
+    const result = checkEntry({ ...goldenInput(), nowMs: 1_000_000, deliveryTimeMs: 1_000_000 + 5 * 24 * 60 * 60 * 1000 });
+    expect(result).toMatchObject({ allowed: false, code: "DELISTING_SCHEDULED" });
   });
 
   it("denies on insufficient perp turnover", () => {

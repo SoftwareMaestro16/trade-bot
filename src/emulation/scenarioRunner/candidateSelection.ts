@@ -167,6 +167,9 @@ async function evaluateCandidate(
     currentBasis,
     basisStdDev,
     exitBasisThreshold: BASIS_DIVERGENCE_THRESHOLD,
+    // Исторических deliveryTime в этой схеме нет — вето делистинга инертно в
+    // бэктесте (0 = нет делистинга), но контракт готов для live (risk/delisting.ts).
+    deliveryTimeMs: 0,
   }, resolved.riskThresholds);
 
   if (!veto.allowed) {

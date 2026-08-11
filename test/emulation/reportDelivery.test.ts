@@ -8,7 +8,7 @@ import {
 import type { GenerateReportsResult } from "../../src/emulation/reportGenerator.js";
 import type { TradeReportInput } from "../../src/analysis/llm/tools/tradeReportTool.js";
 import { buildToolset } from "../../src/analysis/llm/index.js";
-import type { LlmClient, LlmPrompt } from "../../src/analysis/llm/index.js";
+import type { LlmClient } from "../../src/analysis/llm/index.js";
 import { LlmError } from "../../src/analysis/llm/index.js";
 
 const REPORTS: GenerateReportsResult = {
@@ -33,7 +33,7 @@ const INPUT: TradeReportInput = {
 
 class FakeLlm implements LlmClient {
   constructor(private readonly reply: string) {}
-  complete(_p: LlmPrompt): Promise<string> {
+  complete(): Promise<string> {
     return Promise.resolve(this.reply);
   }
 }
