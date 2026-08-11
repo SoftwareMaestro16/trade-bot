@@ -29,6 +29,8 @@ import { gatherMarketStats } from "./analysis/marketStats.js";
 import { assessMarket } from "./analysis/marketAssessment.js";
 import type { SymbolMarketStat } from "./analysis/marketAssessment.js";
 import { TtlCache } from "./analysis/ttlCache.js";
+import { fetchRecentAnnouncements, formatAnnouncementsContext } from "./market-data/announcements.js";
+import type { Announcement } from "./market-data/announcements.js";
 import { formatAssessmentFacts } from "./analysis/llm/tools/marketAssessmentTool.js";
 import { computeOutlook, formatOutlookFacts } from "./analysis/llm/tools/opportunityOutlookTool.js";
 import { buildFallbackClient, buildToolset, buildHealthTargets } from "./analysis/llm/index.js";
@@ -373,15 +375,19 @@ async function main(): Promise<void> {
   // Оценка рынка + перспектива в plain-text для editMessage (editMenuMessage
   // шлёт без parse_mode). Вся арифметика — в протестированных assessMarket/
   // computeOutlook; здесь только сборка строки.
-  function marketText(assessment: ReturnType<typeof assessMarket>): string {
-    return [
+  function marketText(assessment: ReturnType<typeof assessMarket>, announcementsCtx: string): string {
+    const parts = [
       "📈 Оценка рынка",
       "",
       formatAssessmentFacts(assessment),
       "",
       "Перспектива:",
       formatOutlookFacts(computeOutlook(assessment)),
-    ].join("\n");
+    ];
+    if (announcementsCtx.length > 0) {
+      parts.push("", `📰 ${announcementsCtx}`);
+    }
+    return parts.join("\n");
   }
 
   // Кэш среза рынка на 5 минут: тап «📈 Рынок» не должен каждый раз бить три
@@ -393,15 +399,29 @@ async function main(): Promise<void> {
   const getMarketStats = (): Promise<SymbolMarketStat[]> =>
     marketStatsCache.getOrCompute(() => gatherMarketStats(statusDb));
 
+  // Анонсы Bybit (листинги/делистинги) — реальные данные биржи для контекста, не
+  // для решений. Кэш 10 минут: анонсы обновляются редко. fetchRecentAnnouncements
+  // сам не бросает (пустой список при сбое), так что анонсы никогда не ломают
+  // сводку рынка.
+  const announcementsCache = new TtlCache<Announcement[]>(10 * 60 * 1000);
+  const getAnnouncementsCtx = async (): Promise<string> =>
+    formatAnnouncementsContext(await announcementsCache.getOrCompute(() => fetchRecentAnnouncements()));
+
   async function renderMarket(): Promise<string> {
-    return marketText(assessMarket(await getMarketStats()));
+    const [stats, annCtx] = await Promise.all([getMarketStats(), getAnnouncementsCtx()]);
+    return marketText(assessMarket(stats), annCtx);
   }
 
   async function renderMarketLlm(): Promise<string> {
-    const stats = await getMarketStats();
-    const base = marketText(assessMarket(stats));
+    const [stats, annCtx] = await Promise.all([getMarketStats(), getAnnouncementsCtx()]);
+    const base = marketText(assessMarket(stats), annCtx);
     if (!toolset) return `${base}\n\n🧠 LLM не настроен (нет LLM_API_KEY).`;
-    const result = await toolset.marketAssessment.run({ stats });
+    // extraContext — заголовки анонсов Bybit; LLM их переформулирует и учтёт в
+    // резюме («скоро делистят X»). Это описание, не сигнал: вход решает risk/.
+    const result = await toolset.marketAssessment.run({
+      stats,
+      ...(annCtx.length > 0 ? { extraContext: annCtx } : {}),
+    });
     return result.narrative
       ? `${base}\n\n🧠 ${result.narrative}`
       : `${base}\n\n🧠 Резюме недоступно: ${result.llmError ?? "н/д"}`;
