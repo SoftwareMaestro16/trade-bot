@@ -17,7 +17,11 @@ import { computeTradeableUniverse } from "./market-data/universe.js";
 import { scheduleDailyAt } from "./notify/dailySchedule.js";
 import { formatDigestTable } from "./notify/formatDigest.js";
 import { startHeartbeat } from "./notify/healthcheck.js";
-import { deliverPending, enqueueRichNotification } from "./notify/notificationQueue.js";
+import { deliverPending, enqueueRichNotification, enqueueNotification } from "./notify/notificationQueue.js";
+import { gatherMarketStats } from "./analysis/marketStats.js";
+import { assessMarket } from "./analysis/marketAssessment.js";
+import { evaluateScan } from "./analysis/scanAlert.js";
+import type { ScanState } from "./analysis/scanAlert.js";
 import { scheduleRepeating, type ScheduledTask } from "./scheduleRepeating.js";
 import { createDb } from "./storage/db.js";
 
@@ -119,6 +123,10 @@ const SETTLED_FUNDING_STALE_AFTER_MS = 540 * 60_000;
 // twice-daily digest schedule below, so a queued message doesn't wait up to
 // 8 hours for its next retry attempt.
 const NOTIFICATION_RETRY_INTERVAL_MS = 15 * 60_000;
+// Периодический скан рынка на «появился шанс заработать». 5 минут — как у
+// прочих не-тиковых задач; рынок за это время ощутимо не меняется, а анти-спам
+// (analysis/scanAlert.ts) не даёт дублировать один и тот же шанс.
+const MARKET_SCAN_INTERVAL_MS = 5 * 60_000;
 
 // Purely diagnostic, not a forced cutoff (see shutdown()'s own doc comment for
 // why a forced deadline isn't safe here): if shutdown() is still waiting on
@@ -255,6 +263,33 @@ async function main(): Promise<void> {
     logger.info(
       { task: "startup", digestHoursUtc: DIGEST_HOURS_UTC },
       "Telegram digest enabled (12:00/20:00 MSK)",
+    );
+
+    // Периодический скан рынка (владелец: «бот сам шлёт, когда есть шанс
+    // заработать»). Собирает срез, оценивает пригодность и алертит ТОЛЬКО на
+    // улучшении в торгуемую зону — анти-спам в analysis/scanAlert.ts. Состояние
+    // в памяти: рестарт перевзводит (при живом шансе алертнёт один раз), это
+    // приемлемо — коллектор перезапускается редко. Оценка — те же
+    // детерминированные assessMarket/vetos, что и кнопка «📈 Рынок».
+    let previousScanState: ScanState | null = null;
+    tasks.push(
+      scheduleRepeating(
+        "market-scan",
+        async () => {
+          const assessment = assessMarket(await gatherMarketStats(db));
+          const decision = evaluateScan(assessment, previousScanState);
+          previousScanState = decision.newState;
+          if (decision.alert && decision.message !== null) {
+            await enqueueNotification(db, decision.message);
+            await deliverPending(db, telegramConfig);
+            logger.info(
+              { task: "market-scan", score: assessment.suitabilityScore, opportunities: assessment.opportunities.length },
+              "market opportunity alert sent",
+            );
+          }
+        },
+        MARKET_SCAN_INTERVAL_MS,
+      ),
     );
 
     // Independent of the digest's own schedule — a message stuck in the
